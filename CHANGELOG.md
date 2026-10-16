@@ -9,7 +9,25 @@ versioning starts at 0.x until the Stage-8 release.
 Stage 1 skeleton of the static client-side TS port of
 [open-referee](https://github.com/paluigi/open-referee).
 
-### Stage 2 — full providers, secrets vault, settings UI
+### Stage 3 — heavy ingestion (PDF, DOCX, artifacts)
+
+- **PDF** via pdf.js (lazy chunk): text extraction with pymupdf-style line
+  joining, `_pdf_text_to_markdown` heading/paragraph heuristics (byte-
+  identical regexes), proportional block→page mapping, heuristic table
+  clusterer (x/y alignment) with Python-parity markdown escaping. Figures
+  deferred (v2); tables are heuristic-only per owner decision 4.
+- **DOCX** via mammoth (lazy chunk) → markdown → canonical Document.
+- **Artifacts module** (`artifacts.py` port): theorem/proof pairing with
+  QED absorption, markdown pipe-table extraction with caption window,
+  definitions pack with symbol-overlap matching.
+- **Async ingest dispatch**: `.pdf`/`.docx`/`.md`/`.txt` from the UI file
+  picker; `.tex` rejected with guidance (no browser LaTeX converter).
+- Deviations from Python documented in code: figures=[], single-backslash
+  latex-symbol collection (Python's double-backslash variant is dead code),
+  pdf.js worker wired for the browser (Node tests use the fake-worker
+  fallback).
+
+## Stage 2 — full providers, secrets vault, settings UI
 
 - Provider factory (`createProvider`) mapping all six provider types with
   Python-parity validation errors; **Anthropic** adapter (browser-direct-
