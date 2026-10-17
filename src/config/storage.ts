@@ -1,4 +1,9 @@
-import { DEFAULT_SETTINGS, type AppSettings, type RoleConfig } from './schema';
+import {
+  DEFAULT_SETTINGS,
+  type AppSettings,
+  type ReviewDepth,
+  type RoleConfig,
+} from './schema';
 
 const STORAGE_KEY = 'openreferee.settings.v1';
 
@@ -83,7 +88,25 @@ export function mergeSettings(raw: unknown): AppSettings {
       raw['searchOrder'].every((s) => typeof s === 'string')
         ? (raw['searchOrder'] as string[])
         : [...d.searchOrder],
+    review: mergeReview(raw['review']),
   };
+}
+
+/** Depth knobs: round-trip only known, type-correct fields (Stage 4). */
+function mergeReview(raw: unknown): ReviewDepth | undefined {
+  if (!isRecord(raw)) return undefined;
+  const out: ReviewDepth = {};
+  const num = (v: unknown): number | undefined =>
+    typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+  const bool = (v: unknown): boolean | undefined =>
+    typeof v === 'boolean' ? v : undefined;
+  out.maxClaims = num(raw['maxClaims']);
+  out.maxArtifacts = num(raw['maxArtifacts']);
+  out.maxParallelCalls = num(raw['maxParallelCalls']);
+  out.perSectionLenses = bool(raw['perSectionLenses']);
+  out.wholePaperPasses = bool(raw['wholePaperPasses']);
+  out.defenseRound = bool(raw['defenseRound']);
+  return out;
 }
 
 /** API keys never reach localStorage — they live in the Stage 2 vault. */

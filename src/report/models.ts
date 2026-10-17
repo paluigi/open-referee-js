@@ -13,6 +13,14 @@ export interface ReviewComment {
   quote: string;
   comment: string;
   severity: number;
+  /** verbatim anchor sentence (Stage-4 claim/defense provenance) */
+  paragraphAnchor?: string;
+  /** claim id from the inventory, when the comment came from a claim worker */
+  claimId?: string;
+  /** artifact id, when the comment came from artifact verification */
+  artifactId?: string;
+  /** math|consistency|evidence|references|clarity|novelty|statistical|other */
+  category?: string;
 }
 
 export interface UsageSummary {

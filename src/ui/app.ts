@@ -19,7 +19,8 @@ import {
   unlockVault,
   vaultIsUnlocked,
 } from '../config/secrets';
-import { readMarkdown } from '../ingestion/readers_md';
+import type { Document } from '../ingestion/document';
+import { ingestByExtensionAsync } from '../ingestion/readers_md';
 import { createProvider, closeProviders } from '../providers/factory';
 import { RateLimiter } from '../providers/rate_limit';
 import type { ChatProvider } from '../providers/base';
@@ -447,22 +448,33 @@ export function mountApp(root: HTMLElement): void {
   const fileInput = el('input', {
     type: 'file',
     id: 'file-input',
-    accept: '.md,.markdown,.txt',
+    accept: '.pdf,.docx,.md,.markdown,.txt',
   });
   const fileName = el('span', { id: 'file-name' }, 'no file selected');
   const progressRoot = el('div', { id: 'progress-root' });
   const output = el('div', { id: 'output' });
   const errorBox = el('p', { id: 'error-box', class: 'error', hidden: '' });
 
-  let doc: ReturnType<typeof readMarkdown> | null = null;
+  let doc: Document | null = null;
 
   fileInput.addEventListener('change', () => {
     const f = fileInput.files?.[0];
     if (!f) return;
     fileName.textContent = f.name;
-    f.text()
-      .then((text) => {
-        doc = readMarkdown(text, 'md', f.name.replace(/\.(md|markdown|txt)$/i, ''));
+    const ext = f.name.slice(f.name.lastIndexOf('.')).toLowerCase();
+    const stem = f.name.replace(/\.(pdf|docx|md|markdown|txt)$/i, '');
+    (async () => {
+      // ArrayBuffer path: heavy readers (pdf/docx) need bytes, not text.
+      const buf = await f.arrayBuffer();
+      return ingestByExtensionAsync(
+        ext,
+        () => f.text(),
+        () => buf,
+        stem,
+      );
+    })()
+      .then((parsed) => {
+        doc = parsed;
         errorBox.hidden = true;
         runBtn.removeAttribute('disabled');
       })
