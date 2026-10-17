@@ -14,6 +14,16 @@ export interface RoleConfig {
   maxTokens?: number;
 }
 
+/** Depth-preset knobs (Python DepthPreset, 'standard' defaults). */
+export interface ReviewDepth {
+  maxClaims?: number;
+  perSectionLenses?: boolean;
+  wholePaperPasses?: boolean;
+  defenseRound?: boolean;
+  maxArtifacts?: number;
+  maxParallelCalls?: number;
+}
+
 export interface AppSettings {
   version: 1;
   providers: Record<string, ProviderConfig>;
@@ -30,6 +40,17 @@ export interface AppSettings {
   maxCostUsd: number;
   /** Search-engine failover order; consumed by the Stage-5 literature router. */
   searchOrder: string[];
+  /**
+   * Search-engine API keys (Stage 5). Session-only, same treatment as
+   * provider apiKey pre-vault: mergeSettings round-trips them, saveSettings
+   * strips them before localStorage.
+   */
+  searchApiKeys?: { tavily?: string; tinyfish?: string };
+  /**
+   * Depth preset (additive; consumers use ?? 'standard' defaults, so old
+   * stored settings without this field stay valid — schema v stays 1).
+   */
+  review?: ReviewDepth;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {

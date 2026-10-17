@@ -9,7 +9,84 @@ versioning starts at 0.x until the Stage-8 release.
 Stage 1 skeleton of the static client-side TS port of
 [open-referee](https://github.com/paluigi/open-referee).
 
-### Stage 2 — full providers, secrets vault, settings UI
+### Stage 5 — literature grounding + community scout
+
+- **Survey stage is now the real literature pack** (Python `_literature`
+  port): OpenAlex work search per triage `search_query` (until 30 items),
+  web-router context via Tavily/TinyFish in `settings.searchOrder`
+  (deduped by normalized title), then a SMALL-role surveyor LLM call
+  (char-parity `surveySystem`) maps `why_relevant` onto selected pack
+  items, pulls `missing_references` through Crossref, and folds
+  `state_of_the_art_notes` into the field hint.
+- **New scout stage** (`triage → claims → survey → scout → verify → …`):
+  PeerReviewScout scans pubpeer.com / openreview.net / prereview.org for
+  prior discussion of the paper and its top 6 key citations; findings
+  extend the context pack. The pack is stored in `artifacts.survey` for
+  resume and feeds the meta-review (SOTA notes).
+- **Fail-soft everywhere in the literature path**: dead APIs, HTTP errors,
+  and CORS blocks (fetch TypeError) degrade to `console.warn` + empty
+  results — a scout source that fails its first probe is dropped for the
+  run after one warning. LLM/budget errors from the surveyor still fail
+  the stage (Python parity).
+- **OpenAlex REST client** with `abstract_inverted_index` reconstruction
+  and `api_key`/`mailto` params; **Crossref client** joins the polite pool
+  via the `mailto` query param (browsers forbid the User-Agent header —
+  documented divergence).
+- **Search keys** (`tavily`, `tinyfish`) are session-only settings inputs;
+  `mergeSettings` round-trips the block and persistence strips it.
+- Old persisted runs without the scout stage keep loading (`stages` is
+  Partial; scout reads back as pending).
+- Deferred (documented): Python's user-supplied literature path
+  (`pack.user_docs` from author PDFs + `source='user_pdf'` OpenAlex
+  matching) — the browser app has no multi-document ingest yet; the
+  `renderPack` user-docs line stays for parity but is empty (Stage 6+).
+  Scout `search_queries` capped at 8 and triage `search_queries` consumed
+  up to 8 per Python `run()`.
+
+### Stage 4 — verification engine (claims, lenses, defense gate)
+
+- **Claim inventory**: the strong model decomposes the manuscript into
+  atomic checkable claims (theorem/proof, equation, numerical, table/text,
+  figure/text, citation, cross-reference, assumption-use, logical) with
+  importance ordering and sanitation.
+- **Typed per-claim verification workers** under a bounded concurrency pool
+  (Python `max_parallel_calls`): strong re-derives math, small checks
+  numbers/tables/citations; per-claim definitions packs from the Stage-3
+  artifacts module; per-claim progress events.
+- **Section verifier lenses** selected from triage (prose / math /
+  empirical / literature) + whole-paper coherence pass, both depth-preset
+  controlled (`review` settings block, additive).
+- **Defense–adjudication quality gate**: a small model argues the strongest
+  honest authors' defense per candidate comment, a strong model adjudicates
+  (upheld / adjusted / dismissed); gate failures never drop comments.
+- **JSON-repair retry** on worker calls (Python RolePool parity); budget
+  exhaustion mid-pool drains gracefully into a partial report.
+- Artifact **vision** passes are stubbed (return no comments) until
+  `ChatMessage` gains image support (Stage 5+); `findMentions`/
+  `nearPageBlocks` are ported and tested ahead of that.
+- Deviations from Python documented in code: artifact vision deferred. The
+  defense gate runs at the challenge tail, matching Python's placement at
+  the end of `_challenge` (its output feeds meta/validate).
+
+## Stage 3 — heavy ingestion (PDF, DOCX, artifacts)
+
+- **PDF** via pdf.js (lazy chunk): text extraction with pymupdf-style line
+  joining, `_pdf_text_to_markdown` heading/paragraph heuristics (byte-
+  identical regexes), proportional block→page mapping, heuristic table
+  clusterer (x/y alignment) with Python-parity markdown escaping. Figures
+  deferred (v2); tables are heuristic-only per owner decision 4.
+- **DOCX** via mammoth (lazy chunk) → markdown → canonical Document.
+- **Artifacts module** (`artifacts.py` port): theorem/proof pairing with
+  QED absorption, markdown pipe-table extraction with caption window,
+  definitions pack with symbol-overlap matching.
+- **Async ingest dispatch**: `.pdf`/`.docx`/`.md`/`.txt` from the UI file
+  picker; `.tex` rejected with guidance (no browser LaTeX converter).
+- Deviations from Python documented in code: figures=[], single-backslash
+  latex-symbol collection (Python's double-backslash variant is dead code),
+  pdf.js worker wired for the browser (Node tests use the fake-worker
+  fallback).
+
+## Stage 2 — full providers, secrets vault, settings UI
 
 - Provider factory (`createProvider`) mapping all six provider types with
   Python-parity validation errors; **Anthropic** adapter (browser-direct-

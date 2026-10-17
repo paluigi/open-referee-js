@@ -19,7 +19,8 @@ import {
   unlockVault,
   vaultIsUnlocked,
 } from '../config/secrets';
-import { readMarkdown } from '../ingestion/readers_md';
+import type { Document } from '../ingestion/document';
+import { ingestByExtensionAsync } from '../ingestion/readers_md';
 import { createProvider, closeProviders } from '../providers/factory';
 import { RateLimiter } from '../providers/rate_limit';
 import type { ChatProvider } from '../providers/base';
@@ -320,6 +321,37 @@ function settingsPanel(settings: AppSettings, onChange: () => void): SettingsUiH
   fieldset.appendChild(el('h2', {}, 'Providers'));
   fieldset.append(providerList, addRow);
 
+  // ---- search engine keys (Stage 5) ----
+  // Session-only like provider keys pre-vault; never persisted (saveSettings
+  // strips the block). Consumed by the literature SearchRouter.
+  const searchKeysRow = (engine: 'tavily' | 'tinyfish'): HTMLDivElement => {
+    const input = el('input', {
+      type: 'password',
+      class: 'search-key',
+      id: `search-key-${engine}`,
+      placeholder: `${engine} API key (session only)`,
+      autocomplete: 'off',
+      'aria-label': `API key for ${engine}`,
+    });
+    input.value = settings.searchApiKeys?.[engine] ?? '';
+    input.addEventListener('change', () => {
+      const v = input.value.trim();
+      if (v) {
+        settings.searchApiKeys = { ...settings.searchApiKeys, [engine]: v };
+      } else {
+        const rest = { ...settings.searchApiKeys };
+        delete rest[engine];
+        settings.searchApiKeys = Object.keys(rest).length > 0 ? rest : undefined;
+      }
+      // saveSettings strips searchApiKeys; this only persists the rest.
+      saveSettings(settings);
+      onChange();
+    });
+    return el('div', { class: 'row search-key-row' }, el('label', {}, engine, input));
+  };
+  fieldset.appendChild(el('h2', {}, 'Search engines'));
+  fieldset.append(searchKeysRow('tavily'), searchKeysRow('tinyfish'));
+
   // ---- role bindings ----
   const roleSelect = (role: (typeof ROLES)[number]): HTMLSelectElement => {
     const sel = el('select', {
@@ -447,22 +479,33 @@ export function mountApp(root: HTMLElement): void {
   const fileInput = el('input', {
     type: 'file',
     id: 'file-input',
-    accept: '.md,.markdown,.txt',
+    accept: '.pdf,.docx,.md,.markdown,.txt',
   });
   const fileName = el('span', { id: 'file-name' }, 'no file selected');
   const progressRoot = el('div', { id: 'progress-root' });
   const output = el('div', { id: 'output' });
   const errorBox = el('p', { id: 'error-box', class: 'error', hidden: '' });
 
-  let doc: ReturnType<typeof readMarkdown> | null = null;
+  let doc: Document | null = null;
 
   fileInput.addEventListener('change', () => {
     const f = fileInput.files?.[0];
     if (!f) return;
     fileName.textContent = f.name;
-    f.text()
-      .then((text) => {
-        doc = readMarkdown(text, 'md', f.name.replace(/\.(md|markdown|txt)$/i, ''));
+    const ext = f.name.slice(f.name.lastIndexOf('.')).toLowerCase();
+    const stem = f.name.replace(/\.(pdf|docx|md|markdown|txt)$/i, '');
+    (async () => {
+      // ArrayBuffer path: heavy readers (pdf/docx) need bytes, not text.
+      const buf = await f.arrayBuffer();
+      return ingestByExtensionAsync(
+        ext,
+        () => f.text(),
+        () => buf,
+        stem,
+      );
+    })()
+      .then((parsed) => {
+        doc = parsed;
         errorBox.hidden = true;
         runBtn.removeAttribute('disabled');
       })
@@ -554,6 +597,7 @@ export function mountApp(root: HTMLElement): void {
         doc: doc,
         settings,
         providers: providers as { strong: ChatProvider; small: ChatProvider },
+        searchApiKeys: settings.searchApiKeys,
         onEvent: (e, p) => progress.onEvent(e, p),
       });
       let state: RunState | undefined;

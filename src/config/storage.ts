@@ -1,4 +1,9 @@
-import { DEFAULT_SETTINGS, type AppSettings, type RoleConfig } from './schema';
+import {
+  DEFAULT_SETTINGS,
+  type AppSettings,
+  type ReviewDepth,
+  type RoleConfig,
+} from './schema';
 
 const STORAGE_KEY = 'openreferee.settings.v1';
 
@@ -83,16 +88,49 @@ export function mergeSettings(raw: unknown): AppSettings {
       raw['searchOrder'].every((s) => typeof s === 'string')
         ? (raw['searchOrder'] as string[])
         : [...d.searchOrder],
+    searchApiKeys: mergeSearchApiKeys(raw['searchApiKeys']),
+    review: mergeReview(raw['review']),
   };
 }
 
-/** API keys never reach localStorage — they live in the Stage 2 vault. */
+/** Stage 5: round-trip only known search-engine keys (session-only). */
+function mergeSearchApiKeys(raw: unknown): AppSettings['searchApiKeys'] | undefined {
+  if (!isRecord(raw)) return undefined;
+  const out: NonNullable<AppSettings['searchApiKeys']> = {};
+  if (typeof raw['tavily'] === 'string' && raw['tavily']) out.tavily = raw['tavily'];
+  if (typeof raw['tinyfish'] === 'string' && raw['tinyfish'])
+    out.tinyfish = raw['tinyfish'];
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Depth knobs: round-trip only known, type-correct fields (Stage 4). */
+function mergeReview(raw: unknown): ReviewDepth | undefined {
+  if (!isRecord(raw)) return undefined;
+  const out: ReviewDepth = {};
+  const num = (v: unknown): number | undefined =>
+    typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+  const bool = (v: unknown): boolean | undefined =>
+    typeof v === 'boolean' ? v : undefined;
+  out.maxClaims = num(raw['maxClaims']);
+  out.maxArtifacts = num(raw['maxArtifacts']);
+  out.maxParallelCalls = num(raw['maxParallelCalls']);
+  out.perSectionLenses = bool(raw['perSectionLenses']);
+  out.wholePaperPasses = bool(raw['wholePaperPasses']);
+  out.defenseRound = bool(raw['defenseRound']);
+  return out;
+}
+
+/**
+ * API keys never reach localStorage — provider keys live in the Stage 2
+ * vault, search keys (Stage 5) are session-only and stripped here too.
+ */
 function stripApiKeys(settings: AppSettings): AppSettings {
   const providers: AppSettings['providers'] = {};
   for (const [name, cfg] of Object.entries(settings.providers)) {
     providers[name] = { type: cfg.type, baseUrl: cfg.baseUrl };
   }
-  return { ...settings, providers };
+  // searchApiKeys stripped: session-only by design.
+  return { ...settings, providers, searchApiKeys: undefined };
 }
 
 export function saveSettings(settings: AppSettings): void {

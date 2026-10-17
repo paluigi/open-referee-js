@@ -9,7 +9,10 @@ import type { StageProgress } from '../pipeline/orchestrator';
 
 const STAGE_LABELS: Record<Stage, string> = {
   triage: 'Triage',
+  claims: 'Claim inventory',
   survey: 'Literature survey',
+  scout: 'Community scout',
+  verify: 'Claim verification',
   challenge: 'Section challenge',
   meta: 'Meta-review',
   validate: 'Validate comments',
@@ -18,7 +21,10 @@ const STAGE_LABELS: Record<Stage, string> = {
 
 const STAGE_ORDER: Stage[] = [
   'triage',
+  'claims',
   'survey',
+  'scout',
+  'verify',
   'challenge',
   'meta',
   'validate',

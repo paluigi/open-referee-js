@@ -1,8 +1,17 @@
 /**
- * The review pipeline orchestrator (Stage 1 minimal flow).
+ * The review pipeline orchestrator (Stage 4 verification engine).
  *
  * Port of Python `open_referee/pipeline/orchestrator.py`, narrowed to:
- * triage -> survey -> challenge (per section) -> meta -> validate -> assemble.
+ * triage -> claims -> survey (literature pack: OpenAlex + web router +
+ * surveyor + Crossref missing-refs) -> scout (community discussion) ->
+ * verify (per-claim workers + lenses + whole-paper) -> challenge (per
+ * section, Python `_challenge` semantics, ending in the defense gate) ->
+ * meta -> validate -> assemble.
+ *
+ * Deferred: Python's user-supplied literature path (pack.user_docs from
+ * author PDFs + OpenAlex metadata matching, source='user_pdf') — the
+ * browser app has no multi-document ingest yet; renderPack keeps the
+ * user-docs line for parity but it is empty in production (Stage 6+).
  *
  * Implemented as an async generator: every StageEvent is yielded AND passed
  * to `onEvent`; the generator's return value is the final RunState with the
@@ -22,19 +31,51 @@ import type { ReviewComment, ReviewReport, UsageSummary } from '../report/models
 import {
   challengerPrompt,
   challengerSystem,
+  empiricalVerifierSystem,
+  litVerifierSystem,
+  mathVerifierSystem,
   metaPrompt,
   metaSystem,
+  proseVerifierSystem,
   triagePrompt,
   triageSystem,
   validatorPrompt,
   validatorSystem,
+  verifierPrompt,
+  wholePaperChallengerPrompt,
+  wholePaperChallengerSystem,
+  wholePaperVerifierPrompt,
+  wholePaperVerifierSystem,
 } from './prompts';
+import {
+  defenseRound,
+  depthPreset,
+  callJsonWithRepair,
+  runClaimInventory,
+  verifyClaims,
+  type CallJson,
+} from './claims';
 import { extractJson } from './json';
+import { normalizeText } from '../ingestion/document';
+import {
+  newContextPack,
+  normalizeTitleKey,
+  renderPack,
+  type ContextPack,
+  type LiteratureItem,
+} from '../literature/types';
+import { OpenAlexClient } from '../literature/openalex';
+import { CrossrefClient } from '../literature/crossref';
+import { SearchRouter, type SearchApiKeys } from '../literature/search';
+import { PeerReviewScout } from '../literature/scout';
+import { surveySystem } from './prompts';
 import type { RunState, Stage, StageEvent } from './state';
 import { createRunState, setStage, stageStatus } from './state';
 
 const MAX_MANUSCRIPT_CHARS = 120_000;
 const MAX_SECTION_CHARS = 40_000;
+/** Python MAX_CITATION_SCANS: key citations the scout scans. */
+const MAX_CITATION_SCANS = 6;
 
 export interface StageProgress {
   unitsDone: number;
@@ -49,13 +90,19 @@ export interface RunReviewOptions {
    * are wired for the later stages (claims/verify/defense) that use it.
    */
   providers: { strong: ChatProvider; small: ChatProvider };
+  /**
+   * Session-only search-engine API keys (same treatment as provider keys
+   * pre-vault). Absent/empty keys simply disable that engine.
+   */
+  searchApiKeys?: SearchApiKeys;
   onEvent?: (e: StageEvent, progress?: StageProgress) => void;
 }
 
 /** Role name as used in settings.roles and ledger bookkeeping. */
 type Role = 'strong' | 'small';
 
-type CallResult =
+/** Result of one budget-checked JSON call (settled by `settle`). */
+export type CallResult =
   | { kind: 'ok'; value: unknown }
   | { kind: 'invalid_json' }
   | { kind: 'llm_error'; error: LLMError }
@@ -64,8 +111,11 @@ type CallResult =
 /** Internal pipeline artifacts accumulated across stages. */
 interface Artifacts {
   triage?: Record<string, unknown>;
-  survey?: unknown;
-  /** challenge comments, before validation */
+  /** claim inventory (claims stage) */
+  claims: Record<string, unknown>[];
+  /** ContextPack from the survey (literature) stage — JSON-safe, resumed. */
+  survey?: ContextPack;
+  /** verify-stage output, before the challenger pass */
   candidates: ReviewComment[];
   /** meta-review markdown */
   overall: string;
@@ -93,6 +143,107 @@ function reviewableSections(doc: Document): { title: string; text: string }[] {
   return out;
 }
 
+/** Python `_norm(t)[:120]`: normalized anchor prefix used for claim matching. */
+function normPrefix(t: string): string {
+  return normalizeText(t).toLowerCase().slice(0, 120);
+}
+
+/** Python `_anchor_in`: the anchor's first 120 normalized chars appear in text. */
+function anchorIn(anchor: string, text: string): boolean {
+  return normalizeText(text).toLowerCase().includes(normPrefix(anchor));
+}
+
+/** Python `_lenses_for`: verifier lens selection based on triage fields. */
+function lensesFor(
+  triage: Record<string, unknown>,
+): { name: string; system: string }[] {
+  const mathDensity = String(triage['mathematical_density'] ?? '').toLowerCase();
+  const statContent = String(triage['statistical_content'] ?? '').toLowerCase();
+  const style = String(triage['methodological_style'] ?? '').toLowerCase();
+
+  const lenses: { name: string; system: string }[] = [
+    { name: 'prose', system: proseVerifierSystem },
+  ];
+  if (
+    ['light', 'moderate', 'heavy'].includes(mathDensity) ||
+    style.includes('theorem') ||
+    ['moderate', 'heavy'].includes(mathDensity)
+  ) {
+    lenses.push({ name: 'math', system: mathVerifierSystem });
+  }
+  if (
+    (statContent !== '' && statContent !== 'none') ||
+    style.includes('empirical') ||
+    statContent.includes('causal')
+  ) {
+    lenses.push({ name: 'empirical', system: empiricalVerifierSystem });
+  }
+  // literature coherence always runs: cheap and central to the review
+  lenses.push({ name: 'lit', system: litVerifierSystem });
+  return lenses;
+}
+
+/** Map a verifier/whole-paper worker's {comments:[...]} to ReviewComments. */
+function normalizeWorkerComments(
+  value: unknown,
+  sectionTitle: string,
+): ReviewComment[] {
+  const out: ReviewComment[] = [];
+  const raw = (value as { comments?: unknown } | null)?.['comments'];
+  if (!Array.isArray(raw)) return out;
+  for (const c of raw) {
+    if (typeof c !== 'object' || c === null) continue;
+    const o = c as Record<string, unknown>;
+    out.push({
+      section: typeof o['section'] === 'string' ? o['section'] : sectionTitle,
+      quote: typeof o['quote'] === 'string' ? o['quote'] : '',
+      comment: typeof o['message'] === 'string' ? o['message'] : '',
+      severity:
+        typeof o['score'] === 'number' ? Math.min(1, Math.max(0, o['score'])) : 0.3,
+      paragraphAnchor:
+        typeof o['paragraph_anchor'] === 'string' ? o['paragraph_anchor'] : undefined,
+      category: typeof o['category'] === 'string' ? o['category'] : undefined,
+    });
+  }
+  return out;
+}
+
+/** Map a challenger validated/new_comments entry to a ReviewComment. */
+function challengerComment(
+  o: Record<string, unknown>,
+  sectionTitle: string,
+  _raw: unknown,
+): ReviewComment {
+  return {
+    section: typeof o['section'] === 'string' ? o['section'] : sectionTitle,
+    quote: typeof o['quote'] === 'string' ? o['quote'] : '',
+    comment: typeof o['message'] === 'string' ? o['message'] : '',
+    severity:
+      typeof o['score'] === 'number' ? Math.min(1, Math.max(0, o['score'])) : 0.3,
+    paragraphAnchor:
+      typeof o['paragraph_anchor'] === 'string' ? o['paragraph_anchor'] : undefined,
+    category: typeof o['category'] === 'string' ? o['category'] : undefined,
+  };
+}
+
+/** Python `_hit_to_item`: a web search hit becomes a web-source LiteratureItem. */
+function hitToItem(
+  hit: { title: string; url: string; snippet: string },
+  why: string,
+): LiteratureItem {
+  return {
+    source: 'web',
+    title: hit.title,
+    authors: [],
+    doi: null,
+    venue: null,
+    citedBy: null,
+    abstract: hit.snippet,
+    url: hit.url,
+    whyRelevant: why,
+  };
+}
+
 function newRunId(): string {
   // Parity with Python: uuid4().hex[:12] — full hex, no hyphens.
   const g = globalThis as { crypto?: { randomUUID?: () => string } };
@@ -109,7 +260,7 @@ function newRunId(): string {
 export async function* runReview(
   opts: RunReviewOptions,
 ): AsyncGenerator<StageEvent, RunState, undefined> {
-  const { doc, settings, providers, onEvent } = opts;
+  const { doc, settings, providers, searchApiKeys, onEvent } = opts;
   const state: RunState = createRunState(newRunId(), doc.title);
   const ledger = new UsageLedger(settings.maxCostUsd, settings.pricing);
 
@@ -122,8 +273,11 @@ export async function* runReview(
    * 'running' forever.
    */
   const pipeline = async function* (): AsyncGenerator<StageEvent, void, undefined> {
-    const artifacts: Artifacts = { candidates: [], overall: '' };
+    const artifacts: Artifacts = { claims: [], candidates: [], overall: '' };
     let budgetError: BudgetExceeded | undefined;
+    const preset = depthPreset(settings.review);
+    /** challenge-stage output (validated + new_comments), feeding meta. */
+    const challengeValidated: ReviewComment[] = [];
 
     const spec = (role: Role): ModelSpec => {
       const rc = settings.roles[role];
@@ -194,11 +348,11 @@ export async function* runReview(
     async function* settle(
       stage: Stage,
       result: CallResult,
-      onOk: (value: unknown) => void,
+      onOk: (value: unknown) => void | Promise<void>,
       progress?: StageProgress,
     ): AsyncGenerator<StageEvent, boolean, undefined> {
       if (result.kind === 'ok') {
-        onOk(result.value);
+        await onOk(result.value);
         yield* emit(stage, 'done', undefined, progress);
         return true;
       }
@@ -234,93 +388,515 @@ export async function* runReview(
       }
     }
 
+    // ------------------------------------------------------------ 1b. claims --
+    if (!budgetError) {
+      yield* emit('claims', 'running');
+      const claimJson: CallJson = (role, system, user) => callJson(role, system, user);
+      const inv = await runClaimInventory({
+        callJson: claimJson,
+        doc,
+        triage: artifacts.triage ?? {},
+        settings,
+      });
+      if (inv.budget) budgetError = inv.budget;
+      artifacts.claims = inv.claims;
+      if (budgetError) {
+        yield* emit('claims', 'failed', `budget cap reached: ${budgetError.message}`);
+      } else if (inv.claims.length > 0) {
+        yield* emit('claims', 'done', `${inv.claims.length} claims catalogued`);
+      } else {
+        // Python logs a warning and continues claimless.
+        state.partial = true;
+        await saveRun(state);
+        yield* emit('claims', 'failed', 'claim inventory failed or produced no claims');
+      }
+    }
+
     // ------------------------------------------------------------ 2. survey --
+    // Python `_literature`: OpenAlex per triage search query until 30 items,
+    // web-router context (recent / non-scholarly), dedupe by normalized title,
+    // then the SMALL surveyor refines why_relevant and surfaces missing
+    // references (Crossref lookups). Literature enrichment is best-effort:
+    // network failures degrade to console.warn, but LLMError/BudgetExceeded
+    // from the surveyor call DO propagate (fail the stage / drain budget).
     if (!budgetError) {
       yield* emit('survey', 'running');
-      const summary = String(artifacts.triage?.summary ?? doc.title);
-      const surveyRes = await callJson(
-        'strong',
-        '',
-        `Survey the literature context for: ${summary}`,
-      );
-      const keep = yield* settle('survey', surveyRes, (v) => {
-        // Stage 1: store the raw skeleton; no network search.
-        artifacts.survey = v;
+      const pack = newContextPack(doc.title);
+      const triage = artifacts.triage ?? {};
+      const domain = triage['domain'];
+      if (typeof domain === 'string') pack.fieldHint = domain;
+      const queries = Array.isArray(triage['search_queries'])
+        ? (triage['search_queries'] as unknown[]).filter(
+            (q): q is string => typeof q === 'string',
+          )
+        : [];
+      const router = new SearchRouter({
+        order: settings.searchOrder,
+        keys: searchApiKeys ?? {},
+      });
+
+      // -- collection (fail-soft: one warn, keep whatever arrived) ----------
+      try {
+        const oa = new OpenAlexClient();
+        const items: LiteratureItem[] = [];
+        // Python run() slices search_queries to 8 (LLM-controlled list —
+        // unbounded would mean unbounded sequential round-trips).
+        for (const q of queries.slice(0, 8)) {
+          items.push(...(await oa.searchWorks(q, 5)));
+          if (items.length >= 30) break;
+        }
+        // Web search for very recent / non-scholarly context.
+        for (const q of queries.slice(0, 3)) {
+          for (const hit of await router.search(q, 4)) {
+            items.push(hitToItem(hit, 'Web result (recent or non-scholarly source)'));
+          }
+        }
+        // Dedupe by normalized title (Python: re.sub(r'\W+','',lower)[:80]).
+        const seen = new Set<string>();
+        for (const it of items) {
+          const key = normalizeTitleKey(it.title);
+          if (key && !seen.has(key)) {
+            seen.add(key);
+            pack.items.push(it);
+          }
+        }
+      } catch (err) {
+        console.warn(
+          `literature collection degraded: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      // -- surveyor refines relevance + missing refs (SMALL role) -----------
+      // The whole survey stage fails (and marks the run partial) only on an
+      // LLM error from the surveyor itself, mirroring Python `_stage_or_resume`
+      // re-raising LLMError; network degradation below never fails the run.
+      const surveyRes = await callJson('small', surveySystem, renderPack(pack, 30));
+      const keep = yield* settle('survey', surveyRes, async (v) => {
+        const survey = (v ?? {}) as Record<string, unknown>;
+        // 1-based index mapping onto the deduped pack items.
+        const selected = Array.isArray(survey['selected']) ? survey['selected'] : [];
+        for (const sel of selected) {
+          if (typeof sel !== 'object' || sel === null) continue;
+          const so = sel as Record<string, unknown>;
+          const idx = so['index'];
+          if (
+            typeof idx === 'number' &&
+            Number.isInteger(idx) &&
+            idx >= 1 &&
+            idx <= pack.items.length
+          ) {
+            const why = so['why_relevant'];
+            pack.items[idx - 1]!.whyRelevant = typeof why === 'string' ? why : null;
+          }
+        }
+        // Missing refs -> Crossref lookup, appended with why_important.
+        // Python awaits these inside the same client context block; lookups
+        // are bounded (5) and fail-soft, so inline await is parity-safe.
+        const missing = Array.isArray(survey['missing_references'])
+          ? survey['missing_references']
+          : [];
+        try {
+          const cr = new CrossrefClient();
+          for (const m of missing.slice(0, 5)) {
+            if (typeof m !== 'object' || m === null) continue;
+            const mo = m as Record<string, unknown>;
+            const title = mo['title'];
+            if (typeof title !== 'string' || title === '') continue;
+            const extra = await cr.lookup(title);
+            if (extra) {
+              const why = mo['why_important'];
+              extra.whyRelevant = typeof why === 'string' ? why : null;
+              pack.items.push(extra);
+            }
+          }
+        } catch (err) {
+          console.warn(
+            `missing-reference enrichment degraded: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        // state_of_the_art_notes appends to field_hint (Python [:400]).
+        const notes = survey['state_of_the_art_notes'];
+        if (typeof notes === 'string') {
+          pack.fieldHint = ((pack.fieldHint ?? '') + ` — ${notes}`).slice(0, 400);
+        }
+        artifacts.survey = pack;
       });
       if (!keep && surveyRes.kind === 'budget') budgetError = surveyRes.error;
     }
 
-    // --------------------------------------------------------- 3. challenge --
+    // -------------------------------------------------------------- 2b. scout --
+    // Python `_scout`: scan the paper title + the top MAX_CITATION_SCANS key
+    // citations on the review-community sites; findings extend the pack.
+    // Entirely fail-soft: a dead search engine or CORS-blocked site can never
+    // fail the run.
+    if (!budgetError && artifacts.survey) {
+      yield* emit('scout', 'running');
+      try {
+        const pack = artifacts.survey;
+        const triage = artifacts.triage ?? {};
+        const keyCitations = Array.isArray(triage['key_citations'])
+          ? (triage['key_citations'] as unknown[]).filter(
+              (c): c is string => typeof c === 'string',
+            )
+          : [];
+        const router = new SearchRouter({
+          order: settings.searchOrder,
+          keys: searchApiKeys ?? {},
+        });
+        const scout = new PeerReviewScout(undefined, router);
+        const found = await scout.scanTitle(doc.title);
+        for (const c of keyCitations.slice(0, MAX_CITATION_SCANS)) {
+          // Python: strip an "Author, Year: " style prefix before scanning.
+          const citTitle = c.replace(/^.*?:\s*/, '');
+          found.push(...(await scout.scanCitation(citTitle)));
+        }
+        pack.items.push(...found.slice(0, 15));
+        yield* emit('scout', 'done', `${found.length} community hits`);
+      } catch (err) {
+        console.warn(
+          `scout degraded: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        yield* emit(
+          'scout',
+          'failed',
+          `scout degraded: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    } else if (!budgetError) {
+      yield* emit('scout', 'skipped', 'no context pack from survey stage');
+    }
+
+    // --------------------------------------------------- 3. verify --
+    // Per-claim workers first (the primary engine), then per-section lenses
+    // (depth preset), then the whole-paper coherence pass. Mirrors Python
+    // `_verify` minus artifact vision (deferred to Stage 5+).
+    if (!budgetError) {
+      yield* emit('verify', 'running');
+      let unitsDone = 0;
+      let stageBroken = false;
+
+      // 3a. per-claim verification workers
+      if (artifacts.claims.length > 0) {
+        const claimJson: CallJson = (role, system, user) =>
+          callJson(role, system, user);
+        const total = artifacts.claims.length;
+        const claimRun = await verifyClaims({
+          callJson: claimJson,
+          doc,
+          claims: artifacts.claims,
+          settings,
+          onWorkerError: () => {
+            stageBroken = true;
+          },
+          onEvent: () => {
+            unitsDone += 1;
+            onEvent?.(
+              { stage: 'verify', status: 'running', at: new Date().toISOString() },
+              { unitsDone, unitsTotal: total },
+            );
+          },
+        });
+        artifacts.candidates.push(...claimRun.comments);
+        if (claimRun.budget) budgetError = claimRun.budget;
+        yield* emit('verify', 'running', `per-claim verification`, {
+          unitsDone,
+          unitsTotal: total,
+        });
+      }
+
+      // 3b. per-section lenses (Python `_lenses_for` + `_reviewable_sections`)
+      if (preset.perSectionLenses) {
+        const lenses = lensesFor(artifacts.triage ?? {});
+        const sections = reviewableSections(doc);
+        const lensTotal = sections.length * lenses.length;
+        for (const lens of lenses) {
+          for (const sec of sections) {
+            const res = await callJsonWithRepair(
+              callJson,
+              'small',
+              lens.system,
+              verifierPrompt(
+                `${sec.title} — ${lens.name} lens`,
+                '',
+                sec.text.slice(0, MAX_SECTION_CHARS),
+              ),
+            );
+            unitsDone += 1;
+            const nowProgress: StageProgress = { unitsDone, unitsTotal: lensTotal };
+            if (res.kind === 'ok') {
+              artifacts.candidates.push(
+                ...normalizeWorkerComments(res.value, sec.title),
+              );
+              yield* emit(
+                'verify',
+                'running',
+                `verified [${lens.name}]: ${sec.title}`,
+                nowProgress,
+              );
+            } else if (res.kind === 'budget') {
+              budgetError = res.error;
+              break;
+            } else {
+              stageBroken = true;
+              yield* emit(
+                'verify',
+                'running',
+                res.kind === 'invalid_json'
+                  ? `invalid JSON for [${lens.name}]: ${sec.title}`
+                  : `LLM error on [${lens.name}] ${sec.title}: ${res.error.message}`,
+                nowProgress,
+              );
+            }
+          }
+          if (budgetError) break;
+        }
+      }
+
+      // 3c. whole-paper coherence pass (strong model, full text)
+      if (!budgetError && preset.wholePaperPasses) {
+        const wpRes = await callJsonWithRepair(
+          callJson,
+          'strong',
+          wholePaperVerifierSystem,
+          wholePaperVerifierPrompt(doc.title, manuscript),
+        );
+        if (wpRes.kind === 'ok') {
+          const n = normalizeWorkerComments(wpRes.value, 'Full manuscript');
+          artifacts.candidates.push(...n);
+          yield* emit('verify', 'running', `whole-paper pass: ${n.length} findings`);
+        } else if (wpRes.kind === 'budget') {
+          budgetError = wpRes.error;
+        } else {
+          stageBroken = true;
+          yield* emit(
+            'verify',
+            'running',
+            wpRes.kind === 'invalid_json'
+              ? 'whole-paper verifier returned invalid JSON'
+              : `whole-paper verifier failed: ${wpRes.error.message}`,
+          );
+        }
+      }
+
+      if (budgetError) {
+        // fall through to the assemble drain
+      } else if (stageBroken) {
+        state.partial = true;
+        await saveRun(state);
+        yield* emit('verify', 'failed', 'one or more verification workers failed');
+      } else {
+        yield* emit('verify', 'done', undefined, {
+          unitsDone,
+          unitsTotal: Math.max(unitsDone, 1),
+        });
+      }
+    }
+
+    // ------------------------------------------------------ 4. challenge --
+    // Python `_challenge` semantics: per-section challenger passes over the
+    // CANDIDATE list (claims + lens findings), then a whole-paper challenger
+    // validates what no section challenger claimed and hunts global issues.
     if (!budgetError) {
       yield* emit('challenge', 'running');
       const sections = reviewableSections(doc);
       let unitsDone = 0;
       let stageBroken = false;
+      const claimedAnchors = new Set<string>();
+      const addClaimed = (comments: ReviewComment[]) => {
+        for (const c of comments)
+          claimedAnchors.add(normPrefix(c.paragraphAnchor ?? ''));
+      };
+
       for (const sec of sections) {
-        const res = await callJson(
+        const cands = artifacts.candidates.filter(
+          (c) =>
+            (c.paragraphAnchor ?? '') !== '' &&
+            anchorIn(c.paragraphAnchor ?? '', sec.text),
+        );
+        const res = await callJsonWithRepair(
+          callJson,
           'strong',
           challengerSystem,
-          challengerPrompt(sec.title, '', sec.text.slice(0, MAX_SECTION_CHARS), '[]'),
+          challengerPrompt(
+            sec.title,
+            '',
+            sec.text.slice(0, MAX_SECTION_CHARS),
+            // Python: json.dumps(cands, indent=1)[:20_000]
+            JSON.stringify(cands, null, 1).slice(0, 20_000),
+          ),
         );
         unitsDone += 1;
         const nowProgress: StageProgress = { unitsDone, unitsTotal: sections.length };
         if (res.kind === 'ok') {
-          const raw = (res.value as { comments?: unknown }).comments;
-          if (Array.isArray(raw)) {
-            for (const c of raw) {
-              if (typeof c !== 'object' || c === null) continue;
-              const o = c as Record<string, unknown>;
-              const severity =
-                typeof o['severity'] === 'number'
-                  ? Math.min(1, Math.max(0, o['severity']))
-                  : 0.3;
-              artifacts.candidates.push({
-                section: typeof o['section'] === 'string' ? o['section'] : sec.title,
-                quote: typeof o['quote'] === 'string' ? o['quote'] : '',
-                comment: typeof o['comment'] === 'string' ? o['comment'] : '',
-                severity,
-              });
+          const o = (res.value ?? {}) as Record<string, unknown>;
+          // kept: challenger verdicts that were not dropped
+          const kept: ReviewComment[] = [];
+          if (Array.isArray(o['validated'])) {
+            for (const v of o['validated']) {
+              if (typeof v !== 'object' || v === null) continue;
+              const vo = v as Record<string, unknown>;
+              if (vo['verdict'] === 'dropped') continue;
+              const src =
+                typeof vo['paragraph_anchor'] === 'string'
+                  ? vo['paragraph_anchor']
+                  : typeof vo['anchor'] === 'string'
+                    ? vo['anchor']
+                    : undefined;
+              const match =
+                src !== undefined
+                  ? (cands.find((c) => (c.paragraphAnchor ?? '') === src) ??
+                    cands.find(
+                      (c) =>
+                        normPrefix(c.paragraphAnchor ?? '') === normPrefix(src) ||
+                        c.quote === vo['quote'],
+                    ))
+                  : undefined;
+              if (match) {
+                const merged: ReviewComment = { ...match };
+                if (typeof vo['paragraph_anchor'] === 'string')
+                  merged.paragraphAnchor = vo['paragraph_anchor'];
+                if (typeof vo['quote'] === 'string') merged.quote = vo['quote'];
+                if (typeof vo['message'] === 'string') merged.comment = vo['message'];
+                if (typeof vo['score'] === 'number')
+                  merged.severity = Math.min(1, Math.max(0, vo['score']));
+                kept.push(merged);
+              } else {
+                kept.push(challengerComment(vo, sec.title, res.value));
+              }
             }
           }
+          // new_comments: hunter findings from this section
+          const fresh: ReviewComment[] = [];
+          if (Array.isArray(o['new_comments'])) {
+            for (const nc of o['new_comments'])
+              fresh.push(challengerComment(nc, sec.title, res.value));
+          }
+          addClaimed(kept);
+          addClaimed(fresh);
+          challengeValidated.push(...kept, ...fresh);
           yield* emit('challenge', 'running', `challenged: ${sec.title}`, nowProgress);
         } else if (res.kind === 'budget') {
           budgetError = res.error;
           break;
         } else {
           stageBroken = true;
-          if (res.kind === 'invalid_json') {
-            yield* emit(
-              'challenge',
-              'running',
-              `invalid JSON for section: ${sec.title}`,
-              nowProgress,
-            );
-          } else {
-            yield* emit(
-              'challenge',
-              'running',
-              `LLM error on section ${sec.title}: ${res.error.message}`,
-              nowProgress,
-            );
-          }
+          // Python: on challenger failure the section's candidates pass through.
+          challengeValidated.push(...cands);
+          yield* emit(
+            'challenge',
+            'running',
+            res.kind === 'invalid_json'
+              ? `invalid JSON for section: ${sec.title}`
+              : `LLM error on section ${sec.title}: ${res.error.message}`,
+            nowProgress,
+          );
         }
       }
-      if (stageBroken) {
+      if (!budgetError) {
+        // whole-paper challenge: validate cross-section candidates (those no
+        // section challenger claimed) and hunt missed global weaknesses
+        const wpCandidates = artifacts.candidates.filter(
+          (c) => !claimedAnchors.has(normPrefix(c.paragraphAnchor ?? '')),
+        );
+        const wpRes = await callJsonWithRepair(
+          callJson,
+          'strong',
+          wholePaperChallengerSystem,
+          wholePaperChallengerPrompt(
+            doc.title,
+            manuscript,
+            // Python: json.dumps(wp_candidates, indent=1)[:30_000]
+            JSON.stringify(wpCandidates, null, 1).slice(0, 30_000),
+          ),
+        );
+        if (wpRes.kind === 'ok') {
+          const o = (wpRes.value ?? {}) as Record<string, unknown>;
+          if (Array.isArray(o['validated'])) {
+            for (const v of o['validated']) {
+              if (typeof v !== 'object' || v === null) continue;
+              const vo = v as Record<string, unknown>;
+              if (vo['verdict'] === 'dropped') continue;
+              const match = wpCandidates.find(
+                (c) =>
+                  normPrefix(c.paragraphAnchor ?? '') ===
+                    normPrefix(
+                      typeof vo['paragraph_anchor'] === 'string'
+                        ? vo['paragraph_anchor']
+                        : '',
+                    ) || c.quote === vo['quote'],
+              );
+              if (match) {
+                const merged: ReviewComment = { ...match };
+                if (typeof vo['paragraph_anchor'] === 'string')
+                  merged.paragraphAnchor = vo['paragraph_anchor'];
+                if (typeof vo['quote'] === 'string') merged.quote = vo['quote'];
+                if (typeof vo['message'] === 'string') merged.comment = vo['message'];
+                if (typeof vo['score'] === 'number')
+                  merged.severity = Math.min(1, Math.max(0, vo['score']));
+                challengeValidated.push(merged);
+              } else {
+                challengeValidated.push(
+                  challengerComment(vo, 'Full manuscript', wpRes.value),
+                );
+              }
+            }
+          }
+          if (Array.isArray(o['new_comments'])) {
+            for (const nc of o['new_comments'])
+              challengeValidated.push(
+                challengerComment(nc, 'Full manuscript', wpRes.value),
+              );
+          }
+          yield* emit('challenge', 'running', 'whole-paper challenge done');
+        } else if (wpRes.kind === 'budget') {
+          budgetError = wpRes.error;
+        } else {
+          // Python logs and keeps going: candidates stay in the flow.
+          stageBroken = true;
+          yield* emit(
+            'challenge',
+            'running',
+            wpRes.kind === 'invalid_json'
+              ? 'whole-paper challenger returned invalid JSON'
+              : `whole-paper challenger failed: ${wpRes.error.message}`,
+          );
+        }
+      }
+      if (budgetError) {
+        // drained
+      } else if (stageBroken) {
         state.partial = true;
         await saveRun(state);
         yield* emit('challenge', 'failed', 'one or more sections failed');
-      } else if (!budgetError) {
+      } else {
         yield* emit('challenge', 'done', undefined, {
           unitsDone,
           unitsTotal: sections.length,
         });
       }
+
+      // ------------------------------------------ challenge tail: defense --
+      // Python parity: defense_round runs at the end of _challenge, so its
+      // output (not the raw candidates) feeds meta and validate.
+      if (!budgetError && preset.defenseRound && challengeValidated.length > 0) {
+        yield* emit('challenge', 'running', 'defense gate');
+        const gate = await defenseRound({
+          callJson,
+          doc,
+          candidates: challengeValidated,
+          settings,
+        });
+        challengeValidated.length = 0;
+        challengeValidated.push(...gate.kept);
+        if (gate.budget) budgetError = gate.budget;
+      }
     }
 
-    // -------------------------------------------------------------- 4. meta --
+    // -------------------------------------------------------------- 5. meta --
     if (!budgetError) {
       yield* emit('meta', 'running');
-      const commentsJson = JSON.stringify(artifacts.candidates);
+      // Python: json.dumps(validated, indent=1)[:60_000]
+      const commentsJson = JSON.stringify(challengeValidated, null, 1).slice(0, 60_000);
       const metaRes = await callJson(
         'strong',
         metaSystem,
@@ -329,7 +905,8 @@ export async function* runReview(
           JSON.stringify(artifacts.triage ?? {}),
           commentsJson,
           '',
-          '',
+          // Python _meta: sota_notes=(pack.field_hint or '')[:1500]
+          (artifacts.survey?.fieldHint ?? '').slice(0, 1500),
         ),
       );
       if (metaRes.kind === 'ok') {
@@ -362,11 +939,12 @@ export async function* runReview(
       }
     }
 
-    // ---------------------------------------------------------- 5. validate --
+    // ---------------------------------------------------------- 6. validate --
     const validated: ReviewComment[] = [];
-    if (!budgetError && artifacts.candidates.length > 0) {
+    if (!budgetError && challengeValidated.length > 0) {
       yield* emit('validate', 'running');
-      const commentsJson = JSON.stringify(artifacts.candidates);
+      // Python: json.dumps(validated, indent=1)[:60_000]
+      const commentsJson = JSON.stringify(challengeValidated, null, 1).slice(0, 60_000);
       const valRes = await callJson(
         'strong',
         validatorSystem,
@@ -381,7 +959,7 @@ export async function* runReview(
           }
         }
         // A fabricated criticism is worse than a missed one: drop rejected.
-        artifacts.candidates.forEach((c, i) => {
+        challengeValidated.forEach((c, i) => {
           if (!rejected.has(i)) validated.push(c);
         });
         yield* emit('validate', 'done');
@@ -389,7 +967,7 @@ export async function* runReview(
         budgetError = valRes.error;
       } else {
         // Keep all candidates when validation itself fails.
-        validated.push(...artifacts.candidates);
+        validated.push(...challengeValidated);
         state.partial = true;
         await saveRun(state);
         yield* emit(
@@ -404,10 +982,19 @@ export async function* runReview(
       yield* emit('validate', 'skipped', 'no candidates to validate');
     }
 
-    // ---------------------------------------------------------- 6. assemble --
+    // ---------------------------------------------------------- 7. assemble --
     if (budgetError) {
       // Mark the never-started stages skipped so the state machine is explicit.
-      const order: Stage[] = ['triage', 'survey', 'challenge', 'meta', 'validate'];
+      const order: Stage[] = [
+        'triage',
+        'claims',
+        'survey',
+        'scout',
+        'verify',
+        'challenge',
+        'meta',
+        'validate',
+      ];
       for (const stage of order) {
         if (stageStatus(state, stage) === 'pending') {
           yield* emit(stage, 'skipped', 'budget cap reached earlier in the run');
@@ -460,7 +1047,17 @@ export async function* runReview(
     yield* pipeline();
   } catch (err) {
     const stuck: Stage | undefined = (
-      ['triage', 'survey', 'challenge', 'meta', 'validate', 'assemble'] as Stage[]
+      [
+        'triage',
+        'claims',
+        'survey',
+        'scout',
+        'verify',
+        'challenge',
+        'meta',
+        'validate',
+        'assemble',
+      ] as Stage[]
     ).find((s) => stageStatus(state, s) === 'running');
     if (stuck) {
       state.partial = true;

@@ -1,13 +1,22 @@
 /**
  * Run state: resumable stage machine for a review run.
  *
- * Port of Python `open_referee/pipeline/state.py`, narrowed to the Stage 1
- * pipeline (triage -> survey -> challenge -> meta -> validate -> assemble).
+ * Port of Python `open_referee/pipeline/state.py`, narrowed to the TS
+ * pipeline (triage -> claims -> survey -> scout -> verify -> challenge ->
+ * meta -> validate -> assemble; bibliography remains a future stage).
  * Pure TypeScript, no I/O: persistence lives in `src/runs/store.ts`.
  */
 
 export type Stage =
-  'triage' | 'survey' | 'challenge' | 'meta' | 'validate' | 'assemble';
+  | 'triage'
+  | 'claims'
+  | 'survey'
+  | 'scout'
+  | 'verify'
+  | 'challenge'
+  | 'meta'
+  | 'validate'
+  | 'assemble';
 
 export type StageStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
 
@@ -36,10 +45,18 @@ export interface RunState {
   updatedAt: string;
 }
 
-/** Canonical stage order of the Stage 1 pipeline. */
+/**
+ * Canonical stage order (Python: ingest -> triage -> claims -> survey ->
+ * scout -> verify -> challenge -> bibliography -> meta -> validate ->
+ * assemble; bibliography deferred). Old persisted runs with the previous
+ * 6- or 8-stage shapes stay readable: `stages` is Partial.
+ */
 export const STAGES: readonly Stage[] = [
   'triage',
+  'claims',
   'survey',
+  'scout',
+  'verify',
   'challenge',
   'meta',
   'validate',

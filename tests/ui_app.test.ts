@@ -50,7 +50,7 @@ describe('mountApp shell', () => {
     expect(root.querySelector('#role-provider-small')).not.toBeNull();
     expect(root.querySelector('#role-provider-vision')).not.toBeNull();
     expect(root.querySelector('#file-input')?.getAttribute('accept')).toBe(
-      '.md,.markdown,.txt',
+      '.pdf,.docx,.md,.markdown,.txt',
     );
     expect(root.querySelector('#run-btn')).not.toBeNull();
     expect(root.querySelector('#progress-root')).not.toBeNull();
