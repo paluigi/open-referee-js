@@ -9,7 +9,32 @@ versioning starts at 0.x until the Stage-8 release.
 Stage 1 skeleton of the static client-side TS port of
 [open-referee](https://github.com/paluigi/open-referee).
 
-### Stage 3 — heavy ingestion (PDF, DOCX, artifacts)
+### Stage 4 — verification engine (claims, lenses, defense gate)
+
+- **Claim inventory**: the strong model decomposes the manuscript into
+  atomic checkable claims (theorem/proof, equation, numerical, table/text,
+  figure/text, citation, cross-reference, assumption-use, logical) with
+  importance ordering and sanitation.
+- **Typed per-claim verification workers** under a bounded concurrency pool
+  (Python `max_parallel_calls`): strong re-derives math, small checks
+  numbers/tables/citations; per-claim definitions packs from the Stage-3
+  artifacts module; per-claim progress events.
+- **Section verifier lenses** selected from triage (prose / math /
+  empirical / literature) + whole-paper coherence pass, both depth-preset
+  controlled (`review` settings block, additive).
+- **Defense–adjudication quality gate**: a small model argues the strongest
+  honest authors' defense per candidate comment, a strong model adjudicates
+  (upheld / adjusted / dismissed); gate failures never drop comments.
+- **JSON-repair retry** on worker calls (Python RolePool parity); budget
+  exhaustion mid-pool drains gracefully into a partial report.
+- Artifact **vision** passes are stubbed (return no comments) until
+  `ChatMessage` gains image support (Stage 5+); `findMentions`/
+  `nearPageBlocks` are ported and tested ahead of that.
+- Deviations from Python documented in code: artifact vision deferred. The
+  defense gate runs at the challenge tail, matching Python's placement at
+  the end of `_challenge` (its output feeds meta/validate).
+
+## Stage 3 — heavy ingestion (PDF, DOCX, artifacts)
 
 - **PDF** via pdf.js (lazy chunk): text extraction with pymupdf-style line
   joining, `_pdf_text_to_markdown` heading/paragraph heuristics (byte-

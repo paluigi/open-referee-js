@@ -27,6 +27,26 @@ describe('mergeSettings', () => {
     expect(mergeSettings({})).toEqual(DEFAULT_SETTINGS);
   });
 
+  it('round-trips the Stage-4 review depth block', () => {
+    const review = {
+      maxClaims: 25,
+      perSectionLenses: false,
+      wholePaperPasses: true,
+      defenseRound: false,
+      maxArtifacts: 4,
+      maxParallelCalls: 3,
+    };
+    const merged = mergeSettings({ review });
+    expect(merged.review).toEqual(review);
+    // unknown/wrong-typed fields dropped, known ones kept
+    const dirty = mergeSettings({
+      review: { defenseRound: 'yes', maxClaims: 12, bogus: 1 },
+    });
+    expect(dirty.review).toEqual({ maxClaims: 12 });
+    // absent review stays absent (defaults apply at use time)
+    expect(mergeSettings({}).review).toBeUndefined();
+  });
+
   it('returns defaults for non-object input', () => {
     expect(mergeSettings(null)).toEqual(DEFAULT_SETTINGS);
     expect(mergeSettings(42)).toEqual(DEFAULT_SETTINGS);

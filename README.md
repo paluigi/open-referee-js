@@ -12,13 +12,15 @@ CORS-open literature APIs: OpenAlex, Crossref, Tavily, TinyFish).
 - Your API key never leaves the page and is never persisted — it lives in
   memory for the session only (opt-in encrypted storage arrives in Stage 2).
 
-## Status: Stage 1 skeleton
+## Status: Stages 1–4 complete
 
-This is the first working vertical slice of the port. It is **not** yet at
-feature parity with the Python original. The Stage-1 pipeline is:
-triage → survey → challenge (per section) → meta-review → validate → assemble,
-with a budget cap that drains into a **partial report** instead of discarding
-the run, and a live progress bar.
+This is a working vertical slice of the port. It is **not** yet at full
+feature parity with the Python original. The pipeline is now:
+triage → claims (atomic claim inventory) → survey → verify (per-claim typed
+workers + section lenses + whole-paper coherence) → challenge (per-section +
+whole-paper challenger) → meta-review → validate → defense–adjudication gate
+→ assemble, with a budget cap that drains into a **partial report** instead
+of discarding the run, and a live progress bar.
 
 Porting roadmap and owner decisions: `docs/exploration.md` (§7) and
 `docs/plans/2026-10-16-implementation-plan.md`.
@@ -26,9 +28,9 @@ Porting roadmap and owner decisions: `docs/exploration.md` (§7) and
 | Stage | Scope                                                                                                                                  |
 | ----- | -------------------------------------------------------------------------------------------------------------------------------------- |
 | 1 ✅  | Skeleton: md ingestion, openai-compatible providers, budget ledger, min-delay rate limiter, orchestrator, report render, UI + progress |
-| 2     | Anthropic/Gemini/Ollama/vLLM adapters, secrets vault, full settings UI                                                                 |
-| 3     | PDF (pdf.js) + DOCX (mammoth) ingestion                                                                                                |
-| 4     | Claim decomposition, verification lenses, defense–adjudication gate                                                                    |
+| 2 ✅  | Anthropic/Gemini/Ollama/vLLM adapters, secrets vault, full settings UI                                                                 |
+| 3 ✅  | PDF (pdf.js) + DOCX (mammoth) ingestion                                                                                                |
+| 4 ✅  | Claim decomposition, verification lenses, defense–adjudication gate                                                                    |
 | 5     | Literature: OpenAlex, Crossref, Tavily + TinyFish router, scouting                                                                     |
 | 6     | Report UX: anchoring, print-to-PDF, run history/resume                                                                                 |
 | 7     | PWA: service worker, cache invalidation on deploy, offline                                                                             |
