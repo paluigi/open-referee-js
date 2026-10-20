@@ -47,6 +47,39 @@ export function ingestByExtension(ext: string, read: () => string): Document {
   unsupportedFormat(suffix);
 }
 
+/**
+ * Async dispatch (Stage 3): markdown stays sync-under-the-hood; .pdf and
+ * .docx route to their heavy readers via injected byte/text accessors (no
+ * Node fs in the browser — the UI passes File reader callbacks). .tex is NOT
+ * supported in the browser build: the Python version uses pylatexenc, which
+ * has no browser equivalent.
+ */
+export async function ingestByExtensionAsync(
+  ext: string,
+  readFileText: () => string | Promise<string>,
+  readFileBuffer: () => ArrayBuffer | Promise<ArrayBuffer>,
+  titleHint = '',
+): Promise<Document> {
+  const suffix = ext.toLowerCase();
+  if (suffix === '.md' || suffix === '.markdown' || suffix === '.txt') {
+    return readMarkdown(await readFileText(), 'md', titleHint);
+  }
+  if (suffix === '.pdf') {
+    const { documentFromPdf } = await import('./pdf');
+    return documentFromPdf(await readFileBuffer(), titleHint);
+  }
+  if (suffix === '.docx') {
+    const { documentFromDocx } = await import('./docx');
+    return documentFromDocx(await readFileBuffer(), titleHint);
+  }
+  if (suffix === '.tex') {
+    throw new UnsupportedFormatError(
+      '.tex not supported in the browser build (no pylatexenc equivalent); convert to .md first',
+    );
+  }
+  unsupportedFormat(suffix);
+}
+
 function bid(i: number): string {
   return `b${String(i).padStart(5, '0')}`;
 }
