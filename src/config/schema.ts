@@ -41,6 +41,12 @@ export interface AppSettings {
   /** Search-engine failover order; consumed by the Stage-5 literature router. */
   searchOrder: string[];
   /**
+   * Search-engine API keys (Stage 5). Session-only, same treatment as
+   * provider apiKey pre-vault: mergeSettings round-trips them, saveSettings
+   * strips them before localStorage.
+   */
+  searchApiKeys?: { tavily?: string; tinyfish?: string };
+  /**
    * Depth preset (additive; consumers use ?? 'standard' defaults, so old
    * stored settings without this field stay valid — schema v stays 1).
    */

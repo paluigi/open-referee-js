@@ -88,8 +88,19 @@ export function mergeSettings(raw: unknown): AppSettings {
       raw['searchOrder'].every((s) => typeof s === 'string')
         ? (raw['searchOrder'] as string[])
         : [...d.searchOrder],
+    searchApiKeys: mergeSearchApiKeys(raw['searchApiKeys']),
     review: mergeReview(raw['review']),
   };
+}
+
+/** Stage 5: round-trip only known search-engine keys (session-only). */
+function mergeSearchApiKeys(raw: unknown): AppSettings['searchApiKeys'] | undefined {
+  if (!isRecord(raw)) return undefined;
+  const out: NonNullable<AppSettings['searchApiKeys']> = {};
+  if (typeof raw['tavily'] === 'string' && raw['tavily']) out.tavily = raw['tavily'];
+  if (typeof raw['tinyfish'] === 'string' && raw['tinyfish'])
+    out.tinyfish = raw['tinyfish'];
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** Depth knobs: round-trip only known, type-correct fields (Stage 4). */
@@ -109,13 +120,17 @@ function mergeReview(raw: unknown): ReviewDepth | undefined {
   return out;
 }
 
-/** API keys never reach localStorage — they live in the Stage 2 vault. */
+/**
+ * API keys never reach localStorage — provider keys live in the Stage 2
+ * vault, search keys (Stage 5) are session-only and stripped here too.
+ */
 function stripApiKeys(settings: AppSettings): AppSettings {
   const providers: AppSettings['providers'] = {};
   for (const [name, cfg] of Object.entries(settings.providers)) {
     providers[name] = { type: cfg.type, baseUrl: cfg.baseUrl };
   }
-  return { ...settings, providers };
+  // searchApiKeys stripped: session-only by design.
+  return { ...settings, providers, searchApiKeys: undefined };
 }
 
 export function saveSettings(settings: AppSettings): void {

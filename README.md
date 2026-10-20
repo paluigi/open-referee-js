@@ -12,15 +12,22 @@ CORS-open literature APIs: OpenAlex, Crossref, Tavily, TinyFish).
 - Your API key never leaves the page and is never persisted — it lives in
   memory for the session only (opt-in encrypted storage arrives in Stage 2).
 
-## Status: Stages 1–4 complete
+## Status: Stages 1–5 complete
 
 This is a working vertical slice of the port. It is **not** yet at full
 feature parity with the Python original. The pipeline is now:
-triage → claims (atomic claim inventory) → survey → verify (per-claim typed
-workers + section lenses + whole-paper coherence) → challenge (per-section +
-whole-paper challenger) → meta-review → validate → defense–adjudication gate
-→ assemble, with a budget cap that drains into a **partial report** instead
-of discarding the run, and a live progress bar.
+triage → claims (atomic claim inventory) → survey (literature: OpenAlex +
+web router + LLM surveyor + Crossref missing-reference lookup, deduped into
+a context pack) → scout (PubPeer / OpenReview / PREreview community scans)
+→ verify (per-claim typed workers + section lenses + whole-paper coherence)
+→ challenge (per-section + whole-paper challenger) → meta-review → validate
+→ defense–adjudication gate → assemble, with a budget cap that drains into
+a **partial report** instead of discarding the run, and a live progress bar.
+
+Literature grounding is **fail-soft**: a dead or CORS-blocked API degrades
+to a console warning and an empty result — it never fails the review run.
+Search engines (Tavily, TinyFish; no Brave — CORS-blocked) are tried in
+`searchOrder` with failover; their keys are session-only in the settings UI.
 
 Porting roadmap and owner decisions: `docs/exploration.md` (§7) and
 `docs/plans/2026-10-16-implementation-plan.md`.
@@ -31,7 +38,7 @@ Porting roadmap and owner decisions: `docs/exploration.md` (§7) and
 | 2 ✅  | Anthropic/Gemini/Ollama/vLLM adapters, secrets vault, full settings UI                                                                 |
 | 3 ✅  | PDF (pdf.js) + DOCX (mammoth) ingestion                                                                                                |
 | 4 ✅  | Claim decomposition, verification lenses, defense–adjudication gate                                                                    |
-| 5     | Literature: OpenAlex, Crossref, Tavily + TinyFish router, scouting                                                                     |
+| 5 ✅  | Literature: OpenAlex, Crossref, Tavily + TinyFish router, scouting                                                                     |
 | 6     | Report UX: anchoring, print-to-PDF, run history/resume                                                                                 |
 | 7     | PWA: service worker, cache invalidation on deploy, offline                                                                             |
 | 8     | Depth presets (fast/standard/deep), release                                                                                            |

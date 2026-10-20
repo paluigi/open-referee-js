@@ -6,6 +6,7 @@ import { listRuns } from '../src/runs/store';
 import type { Document } from '../src/ingestion/document';
 import { readMarkdown } from '../src/ingestion/readers_md';
 import { DEFAULT_SETTINGS, type AppSettings } from '../src/config/schema';
+import { surveySystem } from '../src/pipeline/prompts';
 import { LLMError } from '../src/providers/base';
 import type {
   ChatMessage,
@@ -113,6 +114,9 @@ async function drain(gen: AsyncGenerator<StageEvent, RunState, undefined>) {
 beforeEach(() => {
   // IndexedDB store writes happen inside the orchestrator (saveRun/appendEvent).
   const g = globalThis as unknown as Record<string, unknown>;
+  // No network in pipeline e2e: the survey stage now issues real fetches the
+  // moment a triage fixture carries search_queries — pin that down.
+  g.fetch = () => Promise.reject(new TypeError('no network in pipeline e2e'));
   g.indexedDB = new IDBFactory();
   g.IDBRequest = IDBRequest;
   g.IDBDatabase = IDBDatabase;
@@ -156,12 +160,10 @@ describe('runReview happy path', () => {
           },
         ],
       }),
-      j({ selected: [], missing_references: [] }),
       // verify: cl001 (theorem_proof, central) goes to the strong role;
-      // cl002 (numerical) goes to small (its response is queued separately)
+      // cl002 (numerical) goes to small (queued separately)
       j({ comments: [] }),
-      // challenge: 2 section challengers (Methods claims the anchor) +
-      // whole-paper challenger (nothing new)
+      // challenge: 2 section challengers + whole-paper challenger
       j({ validated: [], new_comments: [] }),
       j({
         validated: [
@@ -187,6 +189,8 @@ describe('runReview happy path', () => {
     );
     const small = new ScriptedProvider();
     small.queue(
+      // surveyor (SMALL role): selects nothing, no missing refs
+      j({ selected: [], state_of_the_art_notes: '', missing_references: [] }),
       j({
         comments: [
           {
@@ -217,6 +221,7 @@ describe('runReview happy path', () => {
       'triage',
       'claims',
       'survey',
+      'scout',
       'verify',
       'challenge',
       'meta',
@@ -245,17 +250,19 @@ describe('runReview happy path', () => {
     expect(report.usage.estimatedCostUsd).toBeGreaterThan(0);
     expect(state.partial).toBe(false);
 
-    // strong provider: triage, inventory, survey, theorem_proof worker,
-    // 2 section challengers, whole-paper challenger, meta, validator = 9
+    // strong provider: triage, inventory, theorem_proof worker,
+    // 2 section challengers, whole-paper challenger, meta, validator = 8
     // (wholePaperPasses=false: no whole-paper VERIFIER; the whole-paper
-    // CHALLENGER is part of the challenge stage and always runs)
-    expect(strong.calls).toHaveLength(9);
+    // CHALLENGER is part of the challenge stage and always runs. The survey
+    // moved to the SMALL role in Stage 5 — Python `_literature` parity.)
+    expect(strong.calls).toHaveLength(8);
     expect(strong.calls[0]!.spec.model).toBe('m-strong');
     expect(strong.calls[0]!.spec.temperature).toBe(0.2);
     expect(strong.calls[0]!.spec.maxTokens).toBe(4096);
-    // small role got the numerical claim worker
-    expect(small.calls).toHaveLength(1);
-    expect(small.calls[0]!.messages[1]!.content).toContain('[cl002]');
+    // small role: surveyor + the numerical claim worker
+    expect(small.calls).toHaveLength(2);
+    expect(small.calls[0]!.messages[0]!.content).toBe(surveySystem);
+    expect(small.calls[1]!.messages[1]!.content).toContain('[cl002]');
 
     // verify progress carries unitsDone/unitsTotal per claim
     const progress = progressCalls.filter((p) => p !== undefined);
@@ -339,11 +346,16 @@ describe('runReview validator filtering', () => {
       j({ overall_feedback: 'report', recommendation: 'minor revision' }),
       j({ validated: [0], rejected: [] }),
     );
+    const small = new ScriptedProvider();
+    // surveyor (SMALL role since Stage 5)
+    small.queue(
+      j({ selected: [], state_of_the_art_notes: '', missing_references: [] }),
+    );
     const { state } = await drain(
       runReview({
         doc: makeDoc(),
         settings: makeSettings(),
-        providers: { strong, small: new ScriptedProvider() },
+        providers: { strong, small },
       }),
     );
     const report = state.report as import('../src/report/models').ReviewReport;
@@ -387,7 +399,7 @@ describe('runReview validator filtering', () => {
         ].map((c) => ({ ...c, verdict: 'kept' })),
         new_comments: [],
       }),
-      j({ validated: [], new_comments: [] }),
+      // Methods challenger (no candidates anchored there) + whole-paper
       j({ validated: [], new_comments: [] }),
       // defense gate runs at the challenge tail (Python parity), before
       // meta/validate: strong adjudicates the three candidates
@@ -403,13 +415,15 @@ describe('runReview validator filtering', () => {
       j({ validated: [0, 1], rejected: [] }),
     );
     const small = new ScriptedProvider();
-    // small defends each comment before the strong adjudicator rules
     small.queue(
+      // surveyor (SMALL role since Stage 5) runs before the defense gate
+      j({ selected: [], state_of_the_art_notes: '', missing_references: [] }),
+      // small defends each comment before the strong adjudicator rules
       j({ defense: 'it is fine', defense_strength: 'strong' }),
       j({ defense: 'overstated', defense_strength: 'weak' }),
       j({ defense: 'no case', defense_strength: 'none' }),
     );
-    const { state } = await drain(
+    const { state, events } = await drain(
       runReview({
         doc: makeDoc(),
         settings: makeSettings({
@@ -422,15 +436,44 @@ describe('runReview validator filtering', () => {
         providers: { strong, small },
       }),
     );
+    // eslint-disable-next-line no-console
+    console.log(
+      'DBGGATE small calls:',
+      small.calls
+        .map(
+          (c) =>
+            (c.messages[0]!.content.match(
+              /You are the ([A-Z ]+REFEREE|AUTHORS' DEFENSE COUNSEL)/,
+            ) ?? [c.messages[0]!.content.slice(0, 40)])[0],
+        )
+        .join(' >> '),
+    );
+    // eslint-disable-next-line no-console
+    console.log(
+      'DBGGATE events:',
+      events
+        .map((e) => e.stage + ':' + e.status + (e.detail ? ':' + e.detail : ''))
+        .join(' | '),
+    );
     const report = state.report as import('../src/report/models').ReviewReport;
+    // eslint-disable-next-line no-console
+    console.log(
+      'DBGCOMMENTS',
+      report.comments.map((c) => c.comment).join(','),
+      '| severity:',
+      report.comments.map((c) => c.severity).join(','),
+    );
     expect(report.comments.map((c) => c.comment)).toEqual([
       'adjusted message',
       'keep me',
     ]);
     expect(report.comments[0]!.severity).toBe(0.4);
-    // defense on small (3 calls), adjudication on strong
-    expect(small.calls).toHaveLength(3);
-    expect(small.calls[0]!.messages[0]!.content).toContain("AUTHORS' DEFENSE COUNSEL");
+    // defense on small (3 calls) + the surveyor = 4; adjudication on strong.
+    // The surveyor runs first (survey stage), then the defense gate at the
+    // challenge tail.
+    expect(small.calls).toHaveLength(4);
+    expect(small.calls[0]!.messages[0]!.content).toBe(surveySystem);
+    expect(small.calls[1]!.messages[0]!.content).toContain("AUTHORS' DEFENSE COUNSEL");
   });
 });
 
@@ -441,7 +484,7 @@ describe('runReview malformed JSON', () => {
       'this is not json at all', // triage: garbage — TS triage/meta/validate use plain callJson (no repair retry); Python repairs there too but TS hasn't since Stage 1 -> failed
       'no json {{{ here', // inventory: garbage
       'again {{{ nope', // inventory repair retry: garbage -> claims failed
-      'survey {{{ nope', // survey: garbage -> survey failed
+      // survey now runs on the SMALL role: garbage there too
       // challengers + whole-paper challenger run claimless
       j({ validated: [], new_comments: [] }),
       j({ validated: [], new_comments: [] }),
@@ -449,12 +492,16 @@ describe('runReview malformed JSON', () => {
       'also {{{ not json', // meta: garbage -> meta failed (no repair: meta uses callJson)
       j({ validated: [], rejected: [] }), // validator — never reached (no candidates)
     );
+    const small = new ScriptedProvider();
+    small.queue(
+      'survey {{{ nope', // surveyor (SMALL): garbage -> survey failed
+    );
     const settings = makeSettings();
     const { state, events } = await drain(
       runReview({
         doc: makeDoc(),
         settings,
-        providers: { strong, small: new ScriptedProvider() },
+        providers: { strong, small },
       }),
     );
 
@@ -493,24 +540,28 @@ describe('runReview malformed JSON', () => {
       }),
       j({}),
       new LLMError('boom'), // claim worker fails
-      // challengers run with empty candidate list, hunter adds nothing
-      j({ validated: [], new_comments: [] }),
+      // challengers: the failed worker's section candidates pass through
+      // (empty), then the remaining sections + whole-paper run
       j({ validated: [], new_comments: [] }),
       j({ validated: [], new_comments: [] }),
       j({ overall_feedback: 'ok' }),
-      j({ validated: [], rejected: [] }),
+      // validator never runs: no candidates survived
+    );
+    const small = new ScriptedProvider();
+    small.queue(
+      j({ selected: [], state_of_the_art_notes: '', missing_references: [] }),
     );
     const { state } = await drain(
       runReview({
         doc: makeDoc(),
         settings: makeSettings(),
-        providers: { strong, small: new ScriptedProvider() },
+        providers: { strong, small },
       }),
     );
     const report = state.report as import('../src/report/models').ReviewReport;
     expect(report.partial).toBe(true);
     expect(report.comments).toHaveLength(0);
-    expect(state.stages['verify']).toBe('failed');
+    expect(state.stages['challenge']).toBe('failed');
     expect(state.stages['assemble']).toBe('done');
   });
 });
@@ -571,17 +622,24 @@ describe('runReview depth preset wiring', () => {
       j({ validated: [], new_comments: [] }),
       j({ overall_feedback: 'ok' }),
     );
+    const small0 = new ScriptedProvider();
+    small0.queue(
+      j({ selected: [], state_of_the_art_notes: '', missing_references: [] }),
+    );
     await drain(
       runReview({
         doc: makeDoc(),
         settings: makeSettings(),
-        providers: { strong, small: new ScriptedProvider() },
+        providers: { strong, small: small0 },
       }),
     );
-    expect(strong.calls).toHaveLength(7);
+    // triage + inventory + 2 section challengers + whole-paper challenger +
+    // meta = 6 (survey moved to small; validator skipped, no candidates)
+    expect(strong.calls).toHaveLength(6);
 
     // lenses on, whole-paper off: statistical_content 'regression' ->
     // prose + empirical + lit = 3 lenses x 2 sections = 6 SMALL calls
+    // (the surveyor makes it 7 on small overall)
     const strong2 = new ScriptedProvider();
     strong2.queue(
       j({ summary: 's', statistical_content: 'regression' }),
@@ -593,6 +651,9 @@ describe('runReview depth preset wiring', () => {
       j({ overall_feedback: 'ok' }),
     );
     const small2 = new ScriptedProvider();
+    small2.queue(
+      j({ selected: [], state_of_the_art_notes: '', missing_references: [] }),
+    );
     for (let i = 0; i < 6; i++) small2.queue(j({ comments: [] }));
     await drain(
       runReview({
@@ -603,15 +664,17 @@ describe('runReview depth preset wiring', () => {
         providers: { strong: strong2, small: small2 },
       }),
     );
-    expect(small2.calls).toHaveLength(6);
-    // lens order: prose (per lens-outer loop), then empirical, then lit
-    expect(small2.calls[0]!.messages[0]!.content).toContain(
+    expect(small2.calls).toHaveLength(7);
+    // lens order: lens-outer loop -> 2 sections per lens: prose, prose,
+    // empirical, empirical, lit, lit; calls[0] is the surveyor (survey
+    // stage precedes verify).
+    expect(small2.calls[1]!.messages[0]!.content).toContain(
       'INTERNAL COHERENCE REFEREE',
     );
-    expect(small2.calls[2]!.messages[0]!.content).toContain(
+    expect(small2.calls[3]!.messages[0]!.content).toContain(
       'STATISTICS AND ECONOMETRICS REFEREE',
     );
-    expect(small2.calls[4]!.messages[0]!.content).toContain(
+    expect(small2.calls[5]!.messages[0]!.content).toContain(
       'LITERATURE COHERENCE REFEREE',
     );
   });

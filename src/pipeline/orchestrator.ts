@@ -2,9 +2,16 @@
  * The review pipeline orchestrator (Stage 4 verification engine).
  *
  * Port of Python `open_referee/pipeline/orchestrator.py`, narrowed to:
- * triage -> claims -> survey -> verify (per-claim workers + lenses +
- * whole-paper) -> challenge (per section, Python `_challenge` semantics,
- * ending in the defense-adjudication gate) -> meta -> validate -> assemble.
+ * triage -> claims -> survey (literature pack: OpenAlex + web router +
+ * surveyor + Crossref missing-refs) -> scout (community discussion) ->
+ * verify (per-claim workers + lenses + whole-paper) -> challenge (per
+ * section, Python `_challenge` semantics, ending in the defense gate) ->
+ * meta -> validate -> assemble.
+ *
+ * Deferred: Python's user-supplied literature path (pack.user_docs from
+ * author PDFs + OpenAlex metadata matching, source='user_pdf') — the
+ * browser app has no multi-document ingest yet; renderPack keeps the
+ * user-docs line for parity but it is empty in production (Stage 6+).
  *
  * Implemented as an async generator: every StageEvent is yielded AND passed
  * to `onEvent`; the generator's return value is the final RunState with the
@@ -50,11 +57,25 @@ import {
 } from './claims';
 import { extractJson } from './json';
 import { normalizeText } from '../ingestion/document';
+import {
+  newContextPack,
+  normalizeTitleKey,
+  renderPack,
+  type ContextPack,
+  type LiteratureItem,
+} from '../literature/types';
+import { OpenAlexClient } from '../literature/openalex';
+import { CrossrefClient } from '../literature/crossref';
+import { SearchRouter, type SearchApiKeys } from '../literature/search';
+import { PeerReviewScout } from '../literature/scout';
+import { surveySystem } from './prompts';
 import type { RunState, Stage, StageEvent } from './state';
 import { createRunState, setStage, stageStatus } from './state';
 
 const MAX_MANUSCRIPT_CHARS = 120_000;
 const MAX_SECTION_CHARS = 40_000;
+/** Python MAX_CITATION_SCANS: key citations the scout scans. */
+const MAX_CITATION_SCANS = 6;
 
 export interface StageProgress {
   unitsDone: number;
@@ -69,6 +90,11 @@ export interface RunReviewOptions {
    * are wired for the later stages (claims/verify/defense) that use it.
    */
   providers: { strong: ChatProvider; small: ChatProvider };
+  /**
+   * Session-only search-engine API keys (same treatment as provider keys
+   * pre-vault). Absent/empty keys simply disable that engine.
+   */
+  searchApiKeys?: SearchApiKeys;
   onEvent?: (e: StageEvent, progress?: StageProgress) => void;
 }
 
@@ -87,7 +113,8 @@ interface Artifacts {
   triage?: Record<string, unknown>;
   /** claim inventory (claims stage) */
   claims: Record<string, unknown>[];
-  survey?: unknown;
+  /** ContextPack from the survey (literature) stage — JSON-safe, resumed. */
+  survey?: ContextPack;
   /** verify-stage output, before the challenger pass */
   candidates: ReviewComment[];
   /** meta-review markdown */
@@ -199,6 +226,24 @@ function challengerComment(
   };
 }
 
+/** Python `_hit_to_item`: a web search hit becomes a web-source LiteratureItem. */
+function hitToItem(
+  hit: { title: string; url: string; snippet: string },
+  why: string,
+): LiteratureItem {
+  return {
+    source: 'web',
+    title: hit.title,
+    authors: [],
+    doi: null,
+    venue: null,
+    citedBy: null,
+    abstract: hit.snippet,
+    url: hit.url,
+    whyRelevant: why,
+  };
+}
+
 function newRunId(): string {
   // Parity with Python: uuid4().hex[:12] — full hex, no hyphens.
   const g = globalThis as { crypto?: { randomUUID?: () => string } };
@@ -215,7 +260,7 @@ function newRunId(): string {
 export async function* runReview(
   opts: RunReviewOptions,
 ): AsyncGenerator<StageEvent, RunState, undefined> {
-  const { doc, settings, providers, onEvent } = opts;
+  const { doc, settings, providers, searchApiKeys, onEvent } = opts;
   const state: RunState = createRunState(newRunId(), doc.title);
   const ledger = new UsageLedger(settings.maxCostUsd, settings.pricing);
 
@@ -303,11 +348,11 @@ export async function* runReview(
     async function* settle(
       stage: Stage,
       result: CallResult,
-      onOk: (value: unknown) => void,
+      onOk: (value: unknown) => void | Promise<void>,
       progress?: StageProgress,
     ): AsyncGenerator<StageEvent, boolean, undefined> {
       if (result.kind === 'ok') {
-        onOk(result.value);
+        await onOk(result.value);
         yield* emit(stage, 'done', undefined, progress);
         return true;
       }
@@ -368,19 +413,157 @@ export async function* runReview(
     }
 
     // ------------------------------------------------------------ 2. survey --
+    // Python `_literature`: OpenAlex per triage search query until 30 items,
+    // web-router context (recent / non-scholarly), dedupe by normalized title,
+    // then the SMALL surveyor refines why_relevant and surfaces missing
+    // references (Crossref lookups). Literature enrichment is best-effort:
+    // network failures degrade to console.warn, but LLMError/BudgetExceeded
+    // from the surveyor call DO propagate (fail the stage / drain budget).
     if (!budgetError) {
       yield* emit('survey', 'running');
-      const summary = String(artifacts.triage?.summary ?? doc.title);
-      const surveyRes = await callJson(
-        'strong',
-        '',
-        `Survey the literature context for: ${summary}`,
-      );
-      const keep = yield* settle('survey', surveyRes, (v) => {
-        // Stage 1: store the raw skeleton; no network search.
-        artifacts.survey = v;
+      const pack = newContextPack(doc.title);
+      const triage = artifacts.triage ?? {};
+      const domain = triage['domain'];
+      if (typeof domain === 'string') pack.fieldHint = domain;
+      const queries = Array.isArray(triage['search_queries'])
+        ? (triage['search_queries'] as unknown[]).filter(
+            (q): q is string => typeof q === 'string',
+          )
+        : [];
+      const router = new SearchRouter({
+        order: settings.searchOrder,
+        keys: searchApiKeys ?? {},
+      });
+
+      // -- collection (fail-soft: one warn, keep whatever arrived) ----------
+      try {
+        const oa = new OpenAlexClient();
+        const items: LiteratureItem[] = [];
+        // Python run() slices search_queries to 8 (LLM-controlled list —
+        // unbounded would mean unbounded sequential round-trips).
+        for (const q of queries.slice(0, 8)) {
+          items.push(...(await oa.searchWorks(q, 5)));
+          if (items.length >= 30) break;
+        }
+        // Web search for very recent / non-scholarly context.
+        for (const q of queries.slice(0, 3)) {
+          for (const hit of await router.search(q, 4)) {
+            items.push(hitToItem(hit, 'Web result (recent or non-scholarly source)'));
+          }
+        }
+        // Dedupe by normalized title (Python: re.sub(r'\W+','',lower)[:80]).
+        const seen = new Set<string>();
+        for (const it of items) {
+          const key = normalizeTitleKey(it.title);
+          if (key && !seen.has(key)) {
+            seen.add(key);
+            pack.items.push(it);
+          }
+        }
+      } catch (err) {
+        console.warn(
+          `literature collection degraded: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      // -- surveyor refines relevance + missing refs (SMALL role) -----------
+      // The whole survey stage fails (and marks the run partial) only on an
+      // LLM error from the surveyor itself, mirroring Python `_stage_or_resume`
+      // re-raising LLMError; network degradation below never fails the run.
+      const surveyRes = await callJson('small', surveySystem, renderPack(pack, 30));
+      const keep = yield* settle('survey', surveyRes, async (v) => {
+        const survey = (v ?? {}) as Record<string, unknown>;
+        // 1-based index mapping onto the deduped pack items.
+        const selected = Array.isArray(survey['selected']) ? survey['selected'] : [];
+        for (const sel of selected) {
+          if (typeof sel !== 'object' || sel === null) continue;
+          const so = sel as Record<string, unknown>;
+          const idx = so['index'];
+          if (
+            typeof idx === 'number' &&
+            Number.isInteger(idx) &&
+            idx >= 1 &&
+            idx <= pack.items.length
+          ) {
+            const why = so['why_relevant'];
+            pack.items[idx - 1]!.whyRelevant = typeof why === 'string' ? why : null;
+          }
+        }
+        // Missing refs -> Crossref lookup, appended with why_important.
+        // Python awaits these inside the same client context block; lookups
+        // are bounded (5) and fail-soft, so inline await is parity-safe.
+        const missing = Array.isArray(survey['missing_references'])
+          ? survey['missing_references']
+          : [];
+        try {
+          const cr = new CrossrefClient();
+          for (const m of missing.slice(0, 5)) {
+            if (typeof m !== 'object' || m === null) continue;
+            const mo = m as Record<string, unknown>;
+            const title = mo['title'];
+            if (typeof title !== 'string' || title === '') continue;
+            const extra = await cr.lookup(title);
+            if (extra) {
+              const why = mo['why_important'];
+              extra.whyRelevant = typeof why === 'string' ? why : null;
+              pack.items.push(extra);
+            }
+          }
+        } catch (err) {
+          console.warn(
+            `missing-reference enrichment degraded: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        // state_of_the_art_notes appends to field_hint (Python [:400]).
+        const notes = survey['state_of_the_art_notes'];
+        if (typeof notes === 'string') {
+          pack.fieldHint = ((pack.fieldHint ?? '') + ` — ${notes}`).slice(0, 400);
+        }
+        artifacts.survey = pack;
       });
       if (!keep && surveyRes.kind === 'budget') budgetError = surveyRes.error;
+    }
+
+    // -------------------------------------------------------------- 2b. scout --
+    // Python `_scout`: scan the paper title + the top MAX_CITATION_SCANS key
+    // citations on the review-community sites; findings extend the pack.
+    // Entirely fail-soft: a dead search engine or CORS-blocked site can never
+    // fail the run.
+    if (!budgetError && artifacts.survey) {
+      yield* emit('scout', 'running');
+      try {
+        const pack = artifacts.survey;
+        const triage = artifacts.triage ?? {};
+        const keyCitations = Array.isArray(triage['key_citations'])
+          ? (triage['key_citations'] as unknown[]).filter(
+              (c): c is string => typeof c === 'string',
+            )
+          : [];
+        const router = new SearchRouter({
+          order: settings.searchOrder,
+          keys: searchApiKeys ?? {},
+        });
+        const scout = new PeerReviewScout(undefined, router);
+        const found = await scout.scanTitle(doc.title);
+        for (const c of keyCitations.slice(0, MAX_CITATION_SCANS)) {
+          // Python: strip an "Author, Year: " style prefix before scanning.
+          const citTitle = c.replace(/^.*?:\s*/, '');
+          found.push(...(await scout.scanCitation(citTitle)));
+        }
+        pack.items.push(...found.slice(0, 15));
+        yield* emit('scout', 'done', `${found.length} community hits`);
+      } catch (err) {
+        console.warn(
+          `scout degraded: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        yield* emit(
+          'scout',
+          'failed',
+          `scout degraded: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    } else if (!budgetError) {
+      yield* emit('scout', 'skipped', 'no context pack from survey stage');
     }
 
     // --------------------------------------------------- 3. verify --
@@ -722,7 +905,8 @@ export async function* runReview(
           JSON.stringify(artifacts.triage ?? {}),
           commentsJson,
           '',
-          '',
+          // Python _meta: sota_notes=(pack.field_hint or '')[:1500]
+          (artifacts.survey?.fieldHint ?? '').slice(0, 1500),
         ),
       );
       if (metaRes.kind === 'ok') {
@@ -805,6 +989,7 @@ export async function* runReview(
         'triage',
         'claims',
         'survey',
+        'scout',
         'verify',
         'challenge',
         'meta',
@@ -866,6 +1051,7 @@ export async function* runReview(
         'triage',
         'claims',
         'survey',
+        'scout',
         'verify',
         'challenge',
         'meta',

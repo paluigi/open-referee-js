@@ -9,6 +9,40 @@ versioning starts at 0.x until the Stage-8 release.
 Stage 1 skeleton of the static client-side TS port of
 [open-referee](https://github.com/paluigi/open-referee).
 
+### Stage 5 — literature grounding + community scout
+
+- **Survey stage is now the real literature pack** (Python `_literature`
+  port): OpenAlex work search per triage `search_query` (until 30 items),
+  web-router context via Tavily/TinyFish in `settings.searchOrder`
+  (deduped by normalized title), then a SMALL-role surveyor LLM call
+  (char-parity `surveySystem`) maps `why_relevant` onto selected pack
+  items, pulls `missing_references` through Crossref, and folds
+  `state_of_the_art_notes` into the field hint.
+- **New scout stage** (`triage → claims → survey → scout → verify → …`):
+  PeerReviewScout scans pubpeer.com / openreview.net / prereview.org for
+  prior discussion of the paper and its top 6 key citations; findings
+  extend the context pack. The pack is stored in `artifacts.survey` for
+  resume and feeds the meta-review (SOTA notes).
+- **Fail-soft everywhere in the literature path**: dead APIs, HTTP errors,
+  and CORS blocks (fetch TypeError) degrade to `console.warn` + empty
+  results — a scout source that fails its first probe is dropped for the
+  run after one warning. LLM/budget errors from the surveyor still fail
+  the stage (Python parity).
+- **OpenAlex REST client** with `abstract_inverted_index` reconstruction
+  and `api_key`/`mailto` params; **Crossref client** joins the polite pool
+  via the `mailto` query param (browsers forbid the User-Agent header —
+  documented divergence).
+- **Search keys** (`tavily`, `tinyfish`) are session-only settings inputs;
+  `mergeSettings` round-trips the block and persistence strips it.
+- Old persisted runs without the scout stage keep loading (`stages` is
+  Partial; scout reads back as pending).
+- Deferred (documented): Python's user-supplied literature path
+  (`pack.user_docs` from author PDFs + `source='user_pdf'` OpenAlex
+  matching) — the browser app has no multi-document ingest yet; the
+  `renderPack` user-docs line stays for parity but is empty (Stage 6+).
+  Scout `search_queries` capped at 8 and triage `search_queries` consumed
+  up to 8 per Python `run()`.
+
 ### Stage 4 — verification engine (claims, lenses, defense gate)
 
 - **Claim inventory**: the strong model decomposes the manuscript into

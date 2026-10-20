@@ -321,6 +321,37 @@ function settingsPanel(settings: AppSettings, onChange: () => void): SettingsUiH
   fieldset.appendChild(el('h2', {}, 'Providers'));
   fieldset.append(providerList, addRow);
 
+  // ---- search engine keys (Stage 5) ----
+  // Session-only like provider keys pre-vault; never persisted (saveSettings
+  // strips the block). Consumed by the literature SearchRouter.
+  const searchKeysRow = (engine: 'tavily' | 'tinyfish'): HTMLDivElement => {
+    const input = el('input', {
+      type: 'password',
+      class: 'search-key',
+      id: `search-key-${engine}`,
+      placeholder: `${engine} API key (session only)`,
+      autocomplete: 'off',
+      'aria-label': `API key for ${engine}`,
+    });
+    input.value = settings.searchApiKeys?.[engine] ?? '';
+    input.addEventListener('change', () => {
+      const v = input.value.trim();
+      if (v) {
+        settings.searchApiKeys = { ...settings.searchApiKeys, [engine]: v };
+      } else {
+        const rest = { ...settings.searchApiKeys };
+        delete rest[engine];
+        settings.searchApiKeys = Object.keys(rest).length > 0 ? rest : undefined;
+      }
+      // saveSettings strips searchApiKeys; this only persists the rest.
+      saveSettings(settings);
+      onChange();
+    });
+    return el('div', { class: 'row search-key-row' }, el('label', {}, engine, input));
+  };
+  fieldset.appendChild(el('h2', {}, 'Search engines'));
+  fieldset.append(searchKeysRow('tavily'), searchKeysRow('tinyfish'));
+
   // ---- role bindings ----
   const roleSelect = (role: (typeof ROLES)[number]): HTMLSelectElement => {
     const sel = el('select', {
@@ -566,6 +597,7 @@ export function mountApp(root: HTMLElement): void {
         doc: doc,
         settings,
         providers: providers as { strong: ChatProvider; small: ChatProvider },
+        searchApiKeys: settings.searchApiKeys,
         onEvent: (e, p) => progress.onEvent(e, p),
       });
       let state: RunState | undefined;

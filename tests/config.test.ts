@@ -47,6 +47,31 @@ describe('mergeSettings', () => {
     expect(mergeSettings({}).review).toBeUndefined();
   });
 
+  it('round-trips the Stage-5 searchApiKeys block (session-only)', () => {
+    const merged = mergeSettings({
+      searchApiKeys: { tavily: 'tv-key', tinyfish: 'tf-key' },
+    });
+    expect(merged.searchApiKeys).toEqual({ tavily: 'tv-key', tinyfish: 'tf-key' });
+    // wrong-typed / empty values dropped
+    expect(
+      mergeSettings({ searchApiKeys: { tavily: 42, tinyfish: '' } }).searchApiKeys,
+    ).toBeUndefined();
+    expect(mergeSettings({ searchApiKeys: 'nope' }).searchApiKeys).toBeUndefined();
+    expect(mergeSettings({}).searchApiKeys).toBeUndefined();
+    // partial keys kept
+    expect(mergeSettings({ searchApiKeys: { tinyfish: 'k' } }).searchApiKeys).toEqual({
+      tinyfish: 'k',
+    });
+  });
+
+  it('never persists searchApiKeys either', () => {
+    saveSettings(mergeSettings({ searchApiKeys: { tavily: 'SECRET-TAVILY' } }));
+    const raw = localStorage.getItem(STORAGE_KEY) ?? '';
+    expect(raw).not.toContain('SECRET-TAVILY');
+    expect(raw).not.toContain('searchApiKeys');
+    expect(loadSettings().searchApiKeys).toBeUndefined();
+  });
+
   it('returns defaults for non-object input', () => {
     expect(mergeSettings(null)).toEqual(DEFAULT_SETTINGS);
     expect(mergeSettings(42)).toEqual(DEFAULT_SETTINGS);
