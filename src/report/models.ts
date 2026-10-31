@@ -15,6 +15,10 @@ export interface ReviewComment {
   severity: number;
   /** verbatim anchor sentence (Stage-4 claim/defense provenance) */
   paragraphAnchor?: string;
+  /** resolved manuscript block id (Python `_resolve_anchor`, Stage 6) */
+  blockId?: string;
+  /** anchor resolution confidence: 1.0 exact | 0.7 multi-hit | 0.6 quote | Jaccard */
+  anchorConfidence?: number;
   /** claim id from the inventory, when the comment came from a claim worker */
   claimId?: string;
   /** artifact id, when the comment came from artifact verification */

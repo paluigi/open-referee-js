@@ -58,6 +58,17 @@ import {
 import { extractJson } from './json';
 import { normalizeText } from '../ingestion/document';
 import {
+  documentFromData,
+  documentToData,
+  type DocumentData,
+} from '../ingestion/document_data';
+import {
+  emptyAudit,
+  runBibliographyAudit,
+  type BibliographyAudit,
+} from './bibliography';
+import { resolveAnchor, sectionOfBlock } from '../report/anchor';
+import {
   newContextPack,
   normalizeTitleKey,
   renderPack,
@@ -69,7 +80,7 @@ import { CrossrefClient } from '../literature/crossref';
 import { SearchRouter, type SearchApiKeys } from '../literature/search';
 import { PeerReviewScout } from '../literature/scout';
 import { surveySystem } from './prompts';
-import type { RunState, Stage, StageEvent } from './state';
+import type { RunState, Stage, StageArtifacts, StageEvent } from './state';
 import { createRunState, setStage, stageStatus } from './state';
 
 const MAX_MANUSCRIPT_CHARS = 120_000;
@@ -96,6 +107,17 @@ export interface RunReviewOptions {
    */
   searchApiKeys?: SearchApiKeys;
   onEvent?: (e: StageEvent, progress?: StageProgress) => void;
+  /**
+   * Resume a persisted run: re-enters at the first non-done stage and skips
+   * stages whose saved artifact exists (Python `_stage_or_resume`). The
+   * document snapshot rides in `resume.state.docData`; pass `providers` (and
+   * optionally refreshed `settings`) to keep driving the run.
+   */
+  resume?: {
+    state: RunState;
+    settings?: AppSettings;
+    providers?: { strong: ChatProvider; small: ChatProvider };
+  };
 }
 
 /** Role name as used in settings.roles and ledger bookkeeping. */
@@ -117,6 +139,10 @@ interface Artifacts {
   survey?: ContextPack;
   /** verify-stage output, before the challenger pass */
   candidates: ReviewComment[];
+  /** challenge-stage output (validated + new_comments) — resumed. */
+  challenge?: ReviewComment[];
+  /** bibliography audit — resumed. */
+  bibliography?: BibliographyAudit;
   /** meta-review markdown */
   overall: string;
   recommendation?: string;
@@ -260,8 +286,36 @@ function newRunId(): string {
 export async function* runReview(
   opts: RunReviewOptions,
 ): AsyncGenerator<StageEvent, RunState, undefined> {
-  const { doc, settings, providers, searchApiKeys, onEvent } = opts;
-  const state: RunState = createRunState(newRunId(), doc.title);
+  const {
+    doc: docOpt,
+    settings: settingsOpt,
+    providers: providersOpt,
+    searchApiKeys: keysOpt,
+    onEvent: eventsOpt,
+    resume,
+  } = opts;
+  let doc = docOpt;
+  let settings = settingsOpt;
+  let providers = providersOpt;
+  const searchApiKeys = keysOpt;
+  const onEvent = eventsOpt;
+  const state: RunState =
+    resume !== undefined ? resume.state : createRunState(newRunId(), doc.title);
+  if (resume !== undefined) {
+    // A resume re-enters with the SAVED document snapshot unless the caller
+    // re-attached one (e.g. the UI re-ingesting the same file).
+    if (!doc && resume.state.docData) {
+      doc = documentFromData(resume.state.docData as DocumentData);
+    }
+    settings = resume.settings ?? settings;
+    if (resume.providers) providers = resume.providers;
+    // The resumed run re-derives partiality from its own stage outcomes —
+    // an interruption or a pre-abort degradation must not poison it.
+    resume.state.partial = false;
+  }
+  if (!doc || !settings || !providers) {
+    throw new Error('runReview: doc, settings and providers are required');
+  }
   const ledger = new UsageLedger(settings.maxCostUsd, settings.pricing);
 
   await saveRun(state);
@@ -273,11 +327,38 @@ export async function* runReview(
    * 'running' forever.
    */
   const pipeline = async function* (): AsyncGenerator<StageEvent, void, undefined> {
-    const artifacts: Artifacts = { claims: [], candidates: [], overall: '' };
+    const savedA = (state.artifacts ?? {}) as Partial<StageArtifacts>;
+    const artifacts: Artifacts = {
+      claims: [],
+      candidates: [],
+      overall: '',
+      ...(state.artifacts as Partial<Artifacts> | undefined),
+    };
+    // draftReview is stored under its own key (Python draft_review); fold it
+    // back into the in-memory meta slots.
+    if (artifacts.overall === '' && savedA.draftReview) {
+      artifacts.overall = savedA.draftReview.overall;
+      artifacts.recommendation = savedA.draftReview.recommendation;
+    }
+    state.artifacts = {
+      triage: artifacts.triage,
+      claims: artifacts.claims,
+      survey: artifacts.survey,
+      candidates: artifacts.candidates,
+      challenge: artifacts.challenge,
+      bibliography: artifacts.bibliography,
+      draftReview:
+        artifacts.overall !== ''
+          ? {
+              overall: artifacts.overall,
+              recommendation: artifacts.recommendation,
+            }
+          : undefined,
+    };
     let budgetError: BudgetExceeded | undefined;
     const preset = depthPreset(settings.review);
     /** challenge-stage output (validated + new_comments), feeding meta. */
-    const challengeValidated: ReviewComment[] = [];
+    const challengeValidated: ReviewComment[] = artifacts.challenge ?? [];
 
     const spec = (role: Role): ModelSpec => {
       const rc = settings.roles[role];
@@ -304,6 +385,51 @@ export async function* runReview(
     }
 
     const manuscript = doc.fullText().slice(0, MAX_MANUSCRIPT_CHARS);
+
+    /** Persist the per-stage artifact map + doc snapshot. */
+    async function syncArtifacts(): Promise<void> {
+      state.artifacts = {
+        triage: artifacts.triage,
+        claims: artifacts.claims,
+        survey: artifacts.survey,
+        // Python artifacts['candidates'] / ['draft_review'] parity.
+        candidates: artifacts.candidates,
+        challenge: artifacts.challenge,
+        bibliography: artifacts.bibliography,
+        draftReview:
+          artifacts.overall !== ''
+            ? {
+                overall: artifacts.overall,
+                recommendation: artifacts.recommendation,
+              }
+            : undefined,
+      };
+      state.docData = documentToData(doc!);
+      await saveRun(state);
+    }
+
+    /** Python `_stage_or_resume` gate: skip a stage whose artifact survived. */
+    function skipIfDone(stage: Stage): boolean {
+      if (resume === undefined) return false;
+      const a = state.artifacts ?? {};
+      const doneWithArtifact =
+        stageStatus(state, stage) === 'done' &&
+        (stage === 'triage'
+          ? a.triage !== undefined
+          : stage === 'claims'
+            ? a.claims !== undefined
+            : stage === 'survey'
+              ? a.survey !== undefined
+              : stage === 'challenge'
+                ? a.challenge !== undefined
+                : stage === 'bibliography'
+                  ? a.bibliography !== undefined
+                  : true);
+      return (
+        doneWithArtifact ||
+        (stageStatus(state, stage) === 'skipped' && state.report !== undefined)
+      );
+    }
 
     /** One budget-checked, usage-recorded, JSON-parsed completion. */
     async function callJson(
@@ -373,23 +499,26 @@ export async function* runReview(
     }
 
     // ------------------------------------------------------------ 1. triage --
-    yield* emit('triage', 'running');
-    const triageRes = await callJson(
-      'strong',
-      triageSystem,
-      triagePrompt(doc.title, manuscript),
-    );
-    {
-      const keep = yield* settle('triage', triageRes, (v) => {
-        artifacts.triage = (v ?? {}) as Record<string, unknown>;
-      });
-      if (!keep) {
-        budgetError = triageRes.kind === 'budget' ? triageRes.error : undefined;
+    if (!skipIfDone('triage')) {
+      yield* emit('triage', 'running');
+      const triageRes = await callJson(
+        'strong',
+        triageSystem,
+        triagePrompt(doc.title, manuscript),
+      );
+      {
+        const keep = yield* settle('triage', triageRes, async (v) => {
+          artifacts.triage = (v ?? {}) as Record<string, unknown>;
+          await syncArtifacts();
+        });
+        if (!keep) {
+          budgetError = triageRes.kind === 'budget' ? triageRes.error : undefined;
+        }
       }
     }
 
     // ------------------------------------------------------------ 1b. claims --
-    if (!budgetError) {
+    if (!budgetError && !skipIfDone('claims')) {
       yield* emit('claims', 'running');
       const claimJson: CallJson = (role, system, user) => callJson(role, system, user);
       const inv = await runClaimInventory({
@@ -400,6 +529,7 @@ export async function* runReview(
       });
       if (inv.budget) budgetError = inv.budget;
       artifacts.claims = inv.claims;
+      await syncArtifacts();
       if (budgetError) {
         yield* emit('claims', 'failed', `budget cap reached: ${budgetError.message}`);
       } else if (inv.claims.length > 0) {
@@ -419,7 +549,9 @@ export async function* runReview(
     // references (Crossref lookups). Literature enrichment is best-effort:
     // network failures degrade to console.warn, but LLMError/BudgetExceeded
     // from the surveyor call DO propagate (fail the stage / drain budget).
-    if (!budgetError) {
+    // if (state.report !== undefined) — a skipped stage stays skipped only
+    // when the run drained to a report; otherwise the run died mid-drain.
+    if (!budgetError && !skipIfDone('survey')) {
       yield* emit('survey', 'running');
       const pack = newContextPack(doc.title);
       const triage = artifacts.triage ?? {};
@@ -520,6 +652,7 @@ export async function* runReview(
           pack.fieldHint = ((pack.fieldHint ?? '') + ` — ${notes}`).slice(0, 400);
         }
         artifacts.survey = pack;
+        await syncArtifacts();
       });
       if (!keep && surveyRes.kind === 'budget') budgetError = surveyRes.error;
     }
@@ -529,7 +662,7 @@ export async function* runReview(
     // citations on the review-community sites; findings extend the pack.
     // Entirely fail-soft: a dead search engine or CORS-blocked site can never
     // fail the run.
-    if (!budgetError && artifacts.survey) {
+    if (!budgetError && artifacts.survey && !skipIfDone('scout')) {
       yield* emit('scout', 'running');
       try {
         const pack = artifacts.survey;
@@ -570,7 +703,7 @@ export async function* runReview(
     // Per-claim workers first (the primary engine), then per-section lenses
     // (depth preset), then the whole-paper coherence pass. Mirrors Python
     // `_verify` minus artifact vision (deferred to Stage 5+).
-    if (!budgetError) {
+    if (!budgetError && !skipIfDone('verify')) {
       yield* emit('verify', 'running');
       let unitsDone = 0;
       let stageBroken = false;
@@ -685,6 +818,10 @@ export async function* runReview(
         await saveRun(state);
         yield* emit('verify', 'failed', 'one or more verification workers failed');
       } else {
+        // Persist the verify output (Python artifacts['candidates']) BEFORE
+        // announcing done — a resume must find the candidates or the
+        // challenge would silently re-run over nothing.
+        await syncArtifacts();
         yield* emit('verify', 'done', undefined, {
           unitsDone,
           unitsTotal: Math.max(unitsDone, 1),
@@ -696,7 +833,7 @@ export async function* runReview(
     // Python `_challenge` semantics: per-section challenger passes over the
     // CANDIDATE list (claims + lens findings), then a whole-paper challenger
     // validates what no section challenger claimed and hunts global issues.
-    if (!budgetError) {
+    if (!budgetError && !skipIfDone('challenge')) {
       yield* emit('challenge', 'running');
       const sections = reviewableSections(doc);
       let unitsDone = 0;
@@ -890,13 +1027,67 @@ export async function* runReview(
         challengeValidated.push(...gate.kept);
         if (gate.budget) budgetError = gate.budget;
       }
+      if (!budgetError) {
+        artifacts.challenge = [...challengeValidated];
+        await syncArtifacts();
+      }
+    }
+
+    // --------------------------------------------------- 4b. bibliography --
+    // Python `_bibliography`: SMALL citation audit against the context pack;
+    // fail-soft (empty audit on LLM error), budget surfaces.
+    if (!budgetError && !skipIfDone('bibliography')) {
+      yield* emit('bibliography', 'running');
+      const bibJson: CallJson = (role, system, user) => callJson(role, system, user);
+      const bibRun = await runBibliographyAudit({
+        callJson: bibJson,
+        doc,
+        pack: artifacts.survey ?? newContextPack(doc.title),
+        settings,
+      });
+      if (bibRun.budget) budgetError = bibRun.budget;
+      artifacts.bibliography = bibRun.audit;
+      await syncArtifacts();
+      if (bibRun.budget) {
+        yield* emit(
+          'bibliography',
+          'failed',
+          `budget cap reached: ${bibRun.budget.message}`,
+        );
+      } else if (
+        bibRun.audit.entries.length === 0 &&
+        bibRun.audit.in_text_issues.length === 0 &&
+        !doc.referencesText
+      ) {
+        yield* emit('bibliography', 'skipped', 'no references section detected');
+      } else if (
+        bibRun.audit.entries.length === 0 &&
+        bibRun.audit.in_text_issues.length === 0
+      ) {
+        // LLM failure: Python logs a warning and carries the empty audit on.
+        state.partial = true;
+        await saveRun(state);
+        yield* emit('bibliography', 'failed', 'citation audit failed (empty result)');
+      } else {
+        yield* emit(
+          'bibliography',
+          'done',
+          `${bibRun.audit.entries.length} entries audited`,
+        );
+      }
     }
 
     // -------------------------------------------------------------- 5. meta --
-    if (!budgetError) {
+    if (!budgetError && !skipIfDone('meta')) {
       yield* emit('meta', 'running');
       // Python: json.dumps(validated, indent=1)[:60_000]
       const commentsJson = JSON.stringify(challengeValidated, null, 1).slice(0, 60_000);
+      // Python `_meta` L619-624: bib_summary rides into the meta prompt.
+      const bib = artifacts.bibliography ?? emptyAudit();
+      const bibSummary = JSON.stringify({
+        entries: bib.entries,
+        in_text_issues: bib.in_text_issues,
+      }).slice(0, 8000);
       const metaRes = await callJson(
         'strong',
         metaSystem,
@@ -904,7 +1095,7 @@ export async function* runReview(
           doc.title,
           JSON.stringify(artifacts.triage ?? {}),
           commentsJson,
-          '',
+          bibSummary,
           // Python _meta: sota_notes=(pack.field_hint or '')[:1500]
           (artifacts.survey?.fieldHint ?? '').slice(0, 1500),
         ),
@@ -922,6 +1113,9 @@ export async function* runReview(
         } else {
           artifacts.overall = '';
         }
+        // Persist the draft review (Python artifacts['draft_review']) BEFORE
+        // announcing done — a resume after meta must not lose the verdict.
+        await syncArtifacts();
         yield* emit('meta', 'done');
       } else if (metaRes.kind === 'budget') {
         budgetError = metaRes.error;
@@ -941,7 +1135,7 @@ export async function* runReview(
 
     // ---------------------------------------------------------- 6. validate --
     const validated: ReviewComment[] = [];
-    if (!budgetError && challengeValidated.length > 0) {
+    if (!budgetError && !skipIfDone('validate') && challengeValidated.length > 0) {
       yield* emit('validate', 'running');
       // Python: json.dumps(validated, indent=1)[:60_000]
       const commentsJson = JSON.stringify(challengeValidated, null, 1).slice(0, 60_000);
@@ -978,7 +1172,7 @@ export async function* runReview(
             : `LLM error: ${valRes.error.message}`,
         );
       }
-    } else if (!budgetError) {
+    } else if (!budgetError && challengeValidated.length === 0) {
       yield* emit('validate', 'skipped', 'no candidates to validate');
     }
 
@@ -992,6 +1186,7 @@ export async function* runReview(
         'scout',
         'verify',
         'challenge',
+        'bibliography',
         'meta',
         'validate',
       ];
@@ -1022,11 +1217,26 @@ export async function* runReview(
       totalCompletionTokens: totals.completion,
     };
 
+    // Python `_assemble`: resolve each comment to a manuscript block and
+    // stamp ids + section titles from the block's section path.
+    const anchored: ReviewComment[] = validated.map((c, i) => {
+      const anchor = c.paragraphAnchor ?? '';
+      const quote = c.quote ?? '';
+      const { blockId, confidence } = resolveAnchor(doc, anchor, quote);
+      return {
+        ...c,
+        id: `c${String(i).padStart(3, '0')}`,
+        blockId: blockId ?? undefined,
+        anchorConfidence: confidence,
+        section: c.section || sectionOfBlock(doc, blockId) || '',
+      };
+    });
+
     const report: ReviewReport = {
       paperTitle: doc.title,
       recommendation,
       overall: artifacts.overall || '_(no meta-review produced)_',
-      comments: validated,
+      comments: anchored,
       usage,
       partial: state.partial || budgetError !== undefined,
       generatedAt: new Date().toISOString(),
@@ -1054,6 +1264,7 @@ export async function* runReview(
         'scout',
         'verify',
         'challenge',
+        'bibliography',
         'meta',
         'validate',
         'assemble',

@@ -56,7 +56,7 @@ describe('RunState', () => {
     expect(Object.keys(ev).sort()).toEqual(['at', 'detail', 'stage', 'status']);
   });
 
-  it('STAGES order is triage -> claims -> survey -> scout -> verify -> challenge -> meta -> validate -> assemble', () => {
+  it('STAGES order is triage -> claims -> survey -> scout -> verify -> challenge -> bibliography -> meta -> validate -> assemble', () => {
     expect([...STAGES]).toEqual([
       'triage',
       'claims',
@@ -64,6 +64,7 @@ describe('RunState', () => {
       'scout',
       'verify',
       'challenge',
+      'bibliography',
       'meta',
       'validate',
       'assemble',
@@ -98,7 +99,9 @@ describe('RunState', () => {
     expect(legacy.stages['verify'] ?? 'pending').toBe('pending');
     for (const s of STAGES) {
       expect(stageStatus(legacy, s)).toBe(
-        s === 'claims' || s === 'verify' || s === 'scout' ? 'pending' : 'done',
+        s === 'claims' || s === 'verify' || s === 'scout' || s === 'bibliography'
+          ? 'pending'
+          : 'done',
       );
     }
     expect(legacy.events).toHaveLength(2);
@@ -125,7 +128,8 @@ describe('RunState', () => {
       updatedAt: '2026-01-01T00:01:00.000Z',
     } as unknown as RunState;
     expect(stageStatus(stage4, 'scout')).toBe('pending');
-    for (const s of STAGES.filter((x) => x !== 'scout')) {
+    expect(stageStatus(stage4, 'bibliography')).toBe('pending');
+    for (const s of STAGES.filter((x) => x !== 'scout' && x !== 'bibliography')) {
       expect(stageStatus(stage4, s)).toBe('done');
     }
   });

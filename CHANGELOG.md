@@ -9,6 +9,34 @@ versioning starts at 0.x until the Stage-8 release.
 Stage 1 skeleton of the static client-side TS port of
 [open-referee](https://github.com/paluigi/open-referee).
 
+### Stage 6 — bibliography audit + report UX
+
+- **New bibliography stage** (`… → challenge → bibliography → meta → …`,
+  Python `_bibliography` port): in-text citations are extracted with a
+  char-parity port of `_extract_intext_citations` (author-year, numeric
+  `[1]`, parenthesized, and natbib `Smith2001` patterns in priority
+  order; span-overlap dedupe; sentence claim context `[:400]`; the
+  `(no in-text citations detected)` fallback) and audited by a SMALL-role
+  LLM call against `referencesText[:30_000]` and the context pack
+  (`renderPack` 25 items). Fail-soft like Python: an LLM/parse failure
+  yields the empty audit and the run continues; only a budget cap
+  surfaces. Old runs without the stage keep loading.
+- **Meta-review wiring**: `bib_summary = json({entries, in_text_issues})
+[:8_000]` now fills the metaPrompt's citation-audit slot (Python
+  `_meta` parity).
+- **Anchor resolution** (Python `_resolve_anchor` / `_section_of_block`
+  port): assembled comments carry `id`, `blockId`, `anchorConfidence`
+  (exact 1.0 / multi-hit 0.7 / quote 0.6 / token-overlap Jaccard > 0.35)
+  and the block's section.
+- **Report UX**: comment cards with a resolved block anchor to the
+  manuscript pane (scroll + highlight, plus a back link); `@media print`
+  stylesheet hides all app chrome, prints the manuscript inline, and
+  breaks pages before report sections; in-progress runs are listed with
+  a **Resume** button that re-enters the pipeline at the first non-done
+  stage (per-stage artifacts — triage/claims/survey/challenge/
+  bibliography — and a document snapshot persist in the run state, so
+  completed stages are never re-called).
+
 ### Stage 5 — literature grounding + community scout
 
 - **Survey stage is now the real literature pack** (Python `_literature`

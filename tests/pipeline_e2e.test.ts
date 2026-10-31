@@ -224,6 +224,7 @@ describe('runReview happy path', () => {
       'scout',
       'verify',
       'challenge',
+      'bibliography',
       'meta',
       'validate',
       'assemble',

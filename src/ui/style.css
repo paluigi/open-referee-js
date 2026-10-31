@@ -89,3 +89,107 @@ blockquote {
   color: #555;
   font-size: 0.9em;
 }
+
+/* ---- Stage 6: anchor links + manuscript pane + resume ----------------- */
+
+.manuscript-pane,
+#manuscript-pane {
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  padding: 1rem 1.25rem;
+  margin-bottom: 1.5rem;
+  max-height: 30rem;
+  overflow-y: auto;
+  background: #fafafa;
+}
+
+.block-highlight {
+  animation: block-flash 1.6s ease-out;
+}
+
+@keyframes block-flash {
+  0% {
+    background: #fff3bf;
+  }
+  100% {
+    background: transparent;
+  }
+}
+
+.anchor-link {
+  font-size: 0.8em;
+  cursor: pointer;
+  margin-left: 0.5rem;
+}
+
+.anchor-back {
+  display: block;
+  font-size: 0.8em;
+  margin: 0.25rem 0;
+  cursor: pointer;
+}
+
+.resume-section h2 {
+  margin-bottom: 0.25rem;
+}
+
+.resume-btn {
+  cursor: pointer;
+}
+
+/* ---- Stage 6: clean report printing ----------------------------------- */
+
+@media print {
+  :root {
+    max-width: none;
+    padding: 0;
+  }
+
+  /* app chrome: settings, file pickers, buttons, vault, resume, progress */
+  fieldset,
+  #settings-panel,
+  .row,
+  .provider-list,
+  .search-key-row,
+  .vault-row,
+  #resume-section,
+  #progress-root,
+  #error-box,
+  #file-input,
+  #file-name,
+  #run-btn,
+  #download-md,
+  h1,
+  .anchor-link,
+  .anchor-back {
+    display: none !important;
+  }
+
+  /* the manuscript pane prints inline (full text, no scroll box) */
+  #manuscript-pane {
+    max-height: none;
+    overflow: visible;
+    border: none;
+    background: none;
+    page-break-after: always;
+  }
+
+  #report-view h2 {
+    page-break-before: auto;
+  }
+
+  /* keep a comment (heading + quote + body) on one printed page */
+  .comment-list li {
+    page-break-inside: avoid;
+  }
+
+  /* major sections start on a fresh page */
+  #report-view > h2,
+  #report-view .report-overall > h2 {
+    page-break-before: always;
+  }
+
+  #report-view > h2:first-of-type {
+    page-break-before: auto;
+  }
+}

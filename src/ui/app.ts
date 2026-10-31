@@ -25,9 +25,12 @@ import { createProvider, closeProviders } from '../providers/factory';
 import { RateLimiter } from '../providers/rate_limit';
 import type { ChatProvider } from '../providers/base';
 import { runReview } from '../pipeline/orchestrator';
+import { loadRun, listRuns } from '../runs/store';
 import type { RunState } from '../pipeline/state';
+import { STAGES, stageStatus } from '../pipeline/state';
 import type { ReviewReport } from '../report/models';
 import { reportToMarkdown } from '../report/render';
+import { documentFromData, type DocumentData } from '../ingestion/document_data';
 import { ProgressController } from './progress';
 import DOMPurify from 'dompurify';
 import { marked } from 'marked';
@@ -416,7 +419,21 @@ function settingsPanel(settings: AppSettings, onChange: () => void): SettingsUiH
 
 // -------------------------------------------------------------------- report --
 
-function reportView(report: ReviewReport, runState: RunState): HTMLElement {
+/** Highlight a manuscript block (scroll + flash) and return the undo. */
+function scrollToBlock(blockId: string): void {
+  const target = document.getElementById(`block-${blockId}`);
+  if (!target) return;
+  target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  target.classList.add('block-highlight');
+  window.setTimeout(() => target.classList.remove('block-highlight'), 1600);
+}
+
+/** Rendered report view (exported for the Stage-6 UI tests). */
+export function reportView(
+  report: ReviewReport,
+  runState: RunState,
+  _manuscriptPane?: HTMLElement | null,
+): HTMLElement {
   const wrap = el('section', { id: 'report-view' });
   const overall = el('div', { class: 'report-overall' });
   overall.innerHTML = renderMarkdown(report.overall);
@@ -434,6 +451,41 @@ function reportView(report: ReviewReport, runState: RunState): HTMLElement {
         c.quote ? el('blockquote', {}, c.quote) : document.createTextNode(''),
         el('p', {}, c.comment),
       );
+      // Stage 6: anchor link to the referenced manuscript block (and back).
+      if (c.blockId) {
+        const back = `comment-${c.id ?? ''}`;
+        const anchorBtn = el(
+          'button',
+          {
+            type: 'button',
+            class: 'anchor-link',
+            'data-block-id': c.blockId,
+            'data-back-target': back,
+          },
+          'show in manuscript →',
+        );
+        anchorBtn.addEventListener('click', () => {
+          // scrollToBlock already scrolls + flash-highlights the block.
+          scrollToBlock(c.blockId!);
+          const blockEl = document.getElementById(`block-${c.blockId}`);
+          const backLink = document.getElementById(back);
+          // "back": a small floating link near the block returns to the comment
+          if (blockEl && backLink) {
+            const returnBtn = el(
+              'button',
+              { type: 'button', class: 'anchor-back' },
+              '← back to comment',
+            );
+            returnBtn.addEventListener('click', () => {
+              backLink.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              returnBtn.remove();
+            });
+            blockEl.appendChild(returnBtn);
+          }
+        });
+        li.appendChild(anchorBtn);
+      }
+      li.id = `comment-${c.id ?? ''}`;
       list.appendChild(li);
     }
     wrap.appendChild(el('h2', {}, `Detailed comments (${report.comments.length})`));
@@ -465,7 +517,115 @@ function reportView(report: ReviewReport, runState: RunState): HTMLElement {
   return wrap;
 }
 
-// --------------------------------------------------------------------- mount --
+// --------------------------------------------------------------- manuscript --
+
+/** Render the ingested document as anchorable blocks (Stage 6, exported for tests). */
+export function manuscriptView(doc: Document): HTMLElement {
+  const pane = el('section', { id: 'manuscript-pane' });
+  pane.appendChild(el('h2', {}, doc.title));
+  for (const b of doc.blocks) {
+    const p = el(b.type === 'heading' ? 'h3' : 'p', { id: `block-${b.id}` }, b.text);
+    pane.appendChild(p);
+  }
+  return pane;
+}
+
+// ---------------------------------------------------------------- runs list --
+
+/** In-progress runs with a Resume button (Stage 6 resume UX). */
+function createResumeSection(io: {
+  settings: AppSettings;
+  progressRoot: HTMLElement;
+  output: HTMLElement;
+  errorBox: HTMLElement;
+  buildProviders: () => Promise<Record<string, ChatProvider>>;
+  setActiveProviders: (p: Record<string, ChatProvider> | null) => void;
+}): Promise<HTMLElement | null> {
+  return (async () => {
+    let runs: RunState[];
+    try {
+      runs = await listRuns();
+    } catch {
+      return null; // IndexedDB unavailable: no resume UI
+    }
+    const resumable = runs.filter(
+      (r) => r.report === undefined && r.docData !== undefined,
+    );
+    if (resumable.length === 0) return null;
+    const section = el('div', { id: 'resume-section', class: 'resume-section' });
+    section.appendChild(el('h2', {}, 'In-progress runs'));
+    for (const r of resumable.slice(0, 5)) {
+      const doneCount = STAGES.filter((s) => stageStatus(r, s) === 'done').length;
+      const btn = el(
+        'button',
+        { type: 'button', class: 'resume-btn', 'data-run-id': r.runId },
+        `Resume “${r.documentTitle}” (${doneCount}/${STAGES.length} stages)`,
+      );
+      btn.addEventListener('click', () => {
+        void (async () => {
+          // Re-read the persisted state (fresh copy) and re-enter the pipeline.
+          const state = await loadRun(r.runId);
+          if (!state) return;
+          let providers: Record<string, ChatProvider> | null = null;
+          try {
+            providers = await io.buildProviders();
+            io.setActiveProviders(providers);
+            const progress = new ProgressController(io.progressRoot);
+            const gen = runReview({
+              doc: null as unknown as Document,
+              settings: io.settings,
+              providers: providers as { strong: ChatProvider; small: ChatProvider },
+              searchApiKeys: io.settings.searchApiKeys,
+              resume: { state, settings: io.settings },
+              onEvent: (e, p) => progress.onEvent(e, p),
+            });
+            let final: RunState | undefined;
+            for (;;) {
+              const next = await gen.next();
+              if (next.done) {
+                final = next.value;
+                break;
+              }
+            }
+            progress.finish(
+              final?.partial
+                ? 'Resumed run finished (partial report)'
+                : 'Resumed run finished — report ready',
+            );
+            if (
+              final &&
+              final.report !== undefined &&
+              typeof final.report === 'object'
+            ) {
+              const merged = el('div', {});
+              if (final.docData) {
+                merged.appendChild(
+                  manuscriptView(documentFromData(final.docData as DocumentData)),
+                );
+              }
+              merged.appendChild(
+                reportView(
+                  final.report as ReviewReport,
+                  final,
+                  merged.firstChild as HTMLElement | null,
+                ),
+              );
+              io.output.replaceChildren(merged);
+            }
+          } catch (err) {
+            io.errorBox.textContent = `Resume failed: ${err instanceof Error ? err.message : String(err)}`;
+            io.errorBox.hidden = false;
+          } finally {
+            if (providers) closeProviders(providers);
+            io.setActiveProviders(null);
+          }
+        })();
+      });
+      section.appendChild(el('div', { class: 'row resume-row' }, btn));
+    }
+    return section;
+  })();
+}
 
 export function mountApp(root: HTMLElement): void {
   const settings = loadSettings();
@@ -588,7 +748,6 @@ export function mountApp(root: HTMLElement): void {
     };
 
     let activeProviders: Record<string, ChatProvider> | null = null;
-
     (async () => {
       const providers = await buildProviders();
       activeProviders = providers;
@@ -618,7 +777,12 @@ export function mountApp(root: HTMLElement): void {
         report = state.report as ReviewReport;
       }
       if (report && state) {
-        output.replaceChildren(reportView(report, state));
+        const merged = el('div', {});
+        if (doc) merged.appendChild(manuscriptView(doc));
+        merged.appendChild(
+          reportView(report, state, merged.firstChild as HTMLElement | null),
+        );
+        output.replaceChildren(merged);
       }
     })()
       .catch((err: unknown) => {
@@ -641,6 +805,55 @@ export function mountApp(root: HTMLElement): void {
   };
   window.addEventListener('beforeunload', unloadHandler);
   window.addEventListener('unload', unloadHandler);
+
+  // Stage 6: in-progress runs list with Resume (async; null when none/IDB down)
+  void createResumeSection({
+    settings,
+    progressRoot,
+    output,
+    errorBox,
+    buildProviders: async () => {
+      // Resume preflight mirrors the run-button preflight.
+      const roles = ['strong', 'small'] as const;
+      for (const role of roles) {
+        const name = settings.roles[role].provider;
+        if (!name)
+          throw new Error(`Bind the ${role} role to a provider in settings first.`);
+        if (!settings.roles[role].model) {
+          throw new Error(`Set the ${role} model name in settings first.`);
+        }
+      }
+      const rateLimiter = new RateLimiter(settings.minDelayS);
+      const providers: Record<string, ChatProvider> = {};
+      const seen = new Map<string, ChatProvider>();
+      for (const role of roles) {
+        const name = settings.roles[role].provider;
+        const cfg = settings.providers[name];
+        if (!cfg) throw new Error(`Role ${role} points at unknown provider "${name}".`);
+        let provider = seen.get(name);
+        if (!provider) {
+          const apiKey = await resolveKey(name);
+          provider = createProvider({
+            providerType: cfg.type,
+            baseUrl: cfg.baseUrl,
+            apiKey: apiKey || undefined,
+            rateLimiter,
+            requestTimeoutS: settings.requestTimeoutS,
+            maxRetries: settings.maxRetries,
+          });
+          seen.set(name, provider);
+        }
+        providers[role] = provider;
+      }
+      return providers;
+    },
+    setActiveProviders: () => {
+      // The resume path closes its providers in its own finally block; the
+      // shared active-run bookkeeping lives inside the resume closure.
+    },
+  }).then((section) => {
+    if (section) root.insertBefore(section, progressRoot);
+  });
 
   root.replaceChildren(
     heading,
