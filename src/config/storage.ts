@@ -1,6 +1,7 @@
 import {
   DEFAULT_SETTINGS,
   type AppSettings,
+  type BudgetSettings,
   type ReviewDepth,
   type RoleConfig,
 } from './schema';
@@ -23,6 +24,7 @@ function mergeProviderConfig(
     'ollama',
     'vllm',
     'fake',
+    'decision',
   ];
   for (const [name, cfg] of Object.entries(raw)) {
     if (!isRecord(cfg) || typeof cfg['type'] !== 'string') continue;
@@ -56,7 +58,30 @@ function mergeRole(raw: unknown, fallback: RoleConfig): RoleConfig {
   if (typeof raw['model'] === 'string') merged.model = raw['model'];
   if (typeof raw['temperature'] === 'number') merged.temperature = raw['temperature'];
   if (typeof raw['maxTokens'] === 'number') merged.maxTokens = raw['maxTokens'];
+  // 7d review (C1): universal rule — non-boolean values are dropped.
+  if (typeof raw['supportsReasoning'] === 'boolean') {
+    merged.supportsReasoning = raw['supportsReasoning'];
+  }
   return merged;
+}
+
+/**
+ * Optional decision-role round-trip (Stage 7e): present only when the stored
+ * block has a string provider AND model — a half-bound role is not a role.
+ */
+function mergeRoleOptional(raw: unknown): RoleConfig | undefined {
+  if (!isRecord(raw)) return undefined;
+  if (typeof raw['provider'] !== 'string' || typeof raw['model'] !== 'string') {
+    return undefined;
+  }
+  const out: RoleConfig = { provider: raw['provider'], model: raw['model'] };
+  if (typeof raw['temperature'] === 'number') out.temperature = raw['temperature'];
+  if (typeof raw['maxTokens'] === 'number') out.maxTokens = raw['maxTokens'];
+  // 7d review (C1): universal rule — non-boolean values are dropped.
+  if (typeof raw['supportsReasoning'] === 'boolean') {
+    out.supportsReasoning = raw['supportsReasoning'];
+  }
+  return out;
 }
 
 /**
@@ -78,6 +103,8 @@ export function mergeSettings(raw: unknown): AppSettings {
       small: mergeRole(rolesRaw['small'], d.roles.small),
       vision: mergeRole(rolesRaw['vision'], d.roles.vision),
     },
+    // Stage 7e decision role: round-trip only when well-formed (universal rule).
+    decisionRole: mergeRoleOptional(raw['decisionRole']),
     pricing: mergePricing(raw['pricing']),
     requestTimeoutS: num(raw['requestTimeoutS'], d.requestTimeoutS),
     maxRetries: num(raw['maxRetries'], d.maxRetries),
@@ -90,6 +117,7 @@ export function mergeSettings(raw: unknown): AppSettings {
         : [...d.searchOrder],
     searchApiKeys: mergeSearchApiKeys(raw['searchApiKeys']),
     review: mergeReview(raw['review']),
+    budget: mergeBudget(raw['budget']),
   };
 }
 
@@ -117,6 +145,44 @@ function mergeReview(raw: unknown): ReviewDepth | undefined {
   out.perSectionLenses = bool(raw['perSectionLenses']);
   out.wholePaperPasses = bool(raw['wholePaperPasses']);
   out.defenseRound = bool(raw['defenseRound']);
+  // 7c budget-tier knob overrides (Python PlanKnobs fields).
+  out.recompute = bool(raw['recompute']);
+  out.verifyPasses = num(raw['verifyPasses']);
+  out.synthesis = bool(raw['synthesis']);
+  out.copyedit = bool(raw['copyedit']);
+  out.defenseSecondRound = bool(raw['defenseSecondRound']);
+  if (
+    raw['claimRouting'] === 'base' ||
+    raw['claimRouting'] === 'strong' ||
+    raw['claimRouting'] === 'all_strong'
+  ) {
+    out.claimRouting = raw['claimRouting'];
+  }
+  if (
+    raw['outputBudget'] === 'low' ||
+    raw['outputBudget'] === 'default' ||
+    raw['outputBudget'] === 'high'
+  ) {
+    out.outputBudget = raw['outputBudget'];
+  }
+  return out;
+}
+
+/** Budget tier block: round-trip depth + ceiling (Stage 7c, universal rule). */
+function mergeBudget(raw: unknown): BudgetSettings | undefined {
+  if (!isRecord(raw)) return undefined;
+  const out: BudgetSettings = {};
+  if (
+    raw['depth'] === 'fast' ||
+    raw['depth'] === 'standard' ||
+    raw['depth'] === 'deep' ||
+    raw['depth'] === 'auto'
+  ) {
+    out.depth = raw['depth'];
+  }
+  if (typeof raw['budgetUsd'] === 'number' && Number.isFinite(raw['budgetUsd'])) {
+    out.budgetUsd = raw['budgetUsd'];
+  }
   return out;
 }
 

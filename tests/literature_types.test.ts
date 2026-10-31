@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  contextPackFromArtifact,
   newContextPack,
   normalizeTitleKey,
   renderPack,
@@ -154,5 +155,52 @@ describe('pack shape', () => {
     };
     p.items = [item];
     expect(renderPack(p)).toBe('# Field context pack (paper: T)\n1. X cited_by:0');
+  });
+});
+
+// ------------------------- ContextPack rebuild from persisted artifact (7d) --
+// Pin of Python ed1d8da: resumed runs load stage artifacts as JSON; the
+// survey artifact must be validated back into a ContextPack with all fields
+// round-tripping (items/bibChecks/userDocs/fieldHint).
+
+describe('contextPackFromArtifact (ed1d8da)', () => {
+  it('round-trips every field from a persisted JSON artifact', () => {
+    const pack = newContextPack('My Paper');
+    pack.fieldHint = 'macro / labor';
+    pack.paperAbstract = 'We study...';
+    pack.items.push({
+      source: 'openalex',
+      title: 'Some Work',
+      authors: ['A. Author'],
+      year: 2020,
+      doi: '10.1/x',
+      venue: 'J',
+      citedBy: 5,
+      abstract: 'abs',
+      url: 'https://openalex.org/W1',
+      whyRelevant: 'rival',
+    });
+    pack.bibChecks.push({ rawEntry: '[1] Smith', status: 'not_found', note: 'n' });
+    pack.userDocs.push('related.pdf');
+    const persisted = JSON.parse(JSON.stringify(pack));
+    const rebuilt = contextPackFromArtifact(persisted);
+    expect(rebuilt).toEqual(pack);
+  });
+
+  it('defaults missing arrays/fields and rejects non-objects', () => {
+    const rebuilt = contextPackFromArtifact({ paperTitle: 'T' });
+    expect(rebuilt).toEqual({
+      paperTitle: 'T',
+      paperAbstract: null,
+      fieldHint: null,
+      items: [],
+      bibChecks: [],
+      userDocs: [],
+    });
+    expect(contextPackFromArtifact('nope')).toBeUndefined();
+    expect(contextPackFromArtifact(null)).toBeUndefined();
+    // a dict-shaped items array (the actual A3 bug) no longer poisons consumers
+    const broken = contextPackFromArtifact({ items: { length: 3 } });
+    expect(broken!.items).toEqual([]);
   });
 });

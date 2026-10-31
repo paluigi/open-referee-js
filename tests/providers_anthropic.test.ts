@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { LLMError } from '../src/providers/base';
 import type { ModelSpec } from '../src/providers/base';
 import { AnthropicProvider } from '../src/providers/anthropic';
+import { setRetryLogger, type RetryLogEvent } from '../src/providers/retry';
 import { RateLimiter } from '../src/providers/rate_limit';
 
 const URL = 'https://api.anthropic.com/v1/messages';
@@ -241,5 +242,46 @@ describe('AnthropicProvider', () => {
   it('close() is a no-op', () => {
     const p = provider(async () => jsonResponse('{}'));
     expect(() => p.close()).not.toThrow();
+  });
+
+  it('logs every retry with model, attempt, error and backoff (814c895)', async () => {
+    const events: RetryLogEvent[] = [];
+    setRetryLogger((e) => events.push({ ...e }));
+    try {
+      const { impl } = mockFetch((_, n) =>
+        n < 2 ? jsonResponse('overloaded', 503) : okResponse(),
+      );
+      const p = provider(impl, {
+        sleep: async () => undefined,
+      });
+      const res = await p.complete([{ role: 'user', content: 'q' }], spec());
+      expect(res.content).toBe('hello world');
+      expect(events).toHaveLength(2);
+      expect(events[0]).toEqual({
+        model: 'anthropic',
+        attempt: 1,
+        error: 'LLMError: HTTP 503: overloaded',
+        backoffMs: 500,
+      });
+      expect(events[1]).toEqual({
+        model: 'anthropic',
+        attempt: 2,
+        error: 'LLMError: HTTP 503: overloaded',
+        backoffMs: 1000,
+      });
+    } finally {
+      setRetryLogger(undefined);
+    }
+    // sink removed: no further collection, no crash
+    setRetryLogger(() => {
+      throw new Error('broken sink');
+    });
+    const { impl } = mockFetch((_, n) =>
+      n < 1 ? jsonResponse('boom', 503) : okResponse(),
+    );
+    const p = provider(impl, { sleep: async () => undefined });
+    const res = await p.complete([{ role: 'user', content: 'q' }], spec());
+    expect(res.content).toBe('hello world');
+    setRetryLogger(undefined);
   });
 });

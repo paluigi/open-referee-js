@@ -20,6 +20,8 @@ const ABSTRACT_RE = /^\*{0,2}abstract\*{0,2}[:.]?\s*/i;
 const EQ_RE = /^\$\$(.+)\$\$$/s;
 /** A bare `References` / `Bibliography` line (optionally starred). */
 const REF_RE = /^\*{0,2}(references|bibliography)\*{0,2}[:.]?\s*$/i;
+/** pandoc-style HTML anchors glued to the front of headings/paragraphs. */
+const ANCHOR_PREFIX_RE = /^(?:<a\b[^>]*>\s*(?:<\/a>)?\s*)+/;
 
 export class UnsupportedFormatError extends Error {
   constructor(message: string) {
@@ -108,7 +110,12 @@ export function documentFromMarkdown(
 
   const paras = text.split(/\n\s*\n/);
   for (const raw of paras) {
-    const para = raw.trim();
+    // e5eedfa: strip leading HTML anchor tags before heading/paragraph
+    // parsing — pandoc-style conversions prefix headings with
+    // <a id=...></a>, which made _HEADING_RE (here HEADING_RE) never match
+    // and collapsed the whole document into one section.
+    const stripped = raw.replace(ANCHOR_PREFIX_RE, '');
+    const para = stripped.trim();
     if (!para) continue;
 
     const hm = HEADING_RE.exec(para);

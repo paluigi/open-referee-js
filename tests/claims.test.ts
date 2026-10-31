@@ -15,6 +15,7 @@ import {
   type CallJson,
 } from '../src/pipeline/claims';
 import type { CallResult } from '../src/pipeline/orchestrator';
+import { metaCommentsJsonCap, reattachProvenance } from '../src/pipeline/orchestrator';
 import type { ReviewComment } from '../src/report/models';
 import type { AppSettings } from '../src/config/schema';
 import { DEFAULT_SETTINGS } from '../src/config/schema';
@@ -77,6 +78,8 @@ function makeDoc(): Document {
 
 describe('depthPreset', () => {
   it('Python standard defaults when settings.review is missing', () => {
+    // 7c: the returned preset is the full PlanKnobs superset — the new
+    // fields carry the Python DepthPreset('standard') defaults.
     expect(depthPreset(undefined)).toEqual({
       maxClaims: 60,
       perSectionLenses: true,
@@ -84,6 +87,13 @@ describe('depthPreset', () => {
       defenseRound: true,
       maxArtifacts: 12,
       maxParallelCalls: 8,
+      recompute: true,
+      verifyPasses: 2,
+      claimRouting: 'strong',
+      outputBudget: 'default',
+      synthesis: true,
+      copyedit: true,
+      defenseSecondRound: false,
     });
   });
 
@@ -175,13 +185,27 @@ describe('runClaimInventory', () => {
     expect(claims).toEqual([]);
   });
 
-  it('retries with the repair suffix on invalid JSON then succeeds', async () => {
+  it('retries with the repair suffix on invalid JSON then succeeds (repair lives in callJson since 7d)', async () => {
+    // 7d: the repair replay moved INTO the orchestrator's callJson (Python
+    // RolePool.complete_json ladder). runClaimInventory forwards to the
+    // injected callJson once; a fake callJson demonstrates the old wrapper
+    // behavior to pin the repair suffix shape the orchestrator now emits.
     const { calls, fn } = scripted([
       { kind: 'invalid_json' },
       j({ claims: [{ components: { s: '1' } }] }),
     ]);
+    const repairWrap: CallJson = async (role, system, user, opts) => {
+      const res = await fn(role, system, user, opts);
+      if (res.kind !== 'invalid_json') return res;
+      return fn(
+        role,
+        system,
+        `${user}\n\nYour previous reply was not valid JSON. Reply again with ONLY the required JSON object, no prose, no code fences.`,
+        opts,
+      );
+    };
     const { claims } = await runClaimInventory({
-      callJson: fn,
+      callJson: repairWrap,
       doc: makeDoc(),
       triage: {},
       settings: makeSettings(),
@@ -330,6 +354,34 @@ describe('verifyClaims', () => {
     expect(comments[0]!.paragraphAnchor).toBe('anchor z');
     expect(comments[0]!.severity).toBe(0.2);
     expect(comments[0]!.comment).toBe('m');
+  });
+  it('uses the resolved plan-knob cap over the depth preset when provided', async () => {
+    const calls: { user: string }[] = [];
+    const fn = async (_role: 'strong' | 'small', _sys: string, user: string) => {
+      calls.push({ user });
+      return {
+        kind: 'ok' as const,
+        value: { comments: [] },
+      };
+    };
+    const claims = [
+      claim('c1', 'central', 'logical'),
+      claim('c2', 'central', 'logical'),
+      claim('c3', 'supporting', 'logical'),
+      claim('c4', 'peripheral', 'logical'),
+    ];
+    // The tier preset would allow more; the plan knob caps at 2.
+    await verifyClaims({
+      callJson: fn,
+      doc: makeDoc(),
+      claims,
+      settings: makeSettings(),
+      maxClaims: 2,
+    });
+    expect(calls).toHaveLength(2);
+    // central claims first (importance ordering preserved)
+    expect(calls[0]!.user).toContain('[c1]');
+    expect(calls[1]!.user).toContain('[c2]');
   });
 });
 
@@ -602,6 +654,41 @@ describe('defenseRound', () => {
     });
     expect(out.map((x) => x.comment)).toEqual(['keep-a', 'c-fixed']);
   });
+  it('second defense round runs on the survivors (deep plans)', async () => {
+    const mk = (msg: string): ReviewComment => ({
+      ...candidate,
+      comment: msg,
+    });
+    const upheld = (n: number) => [
+      j({ defense: 'd', defense_strength: 'weak' }),
+      j({ verdict: 'upheld', reason: 'ok', comment: { score: 0.6 + n * 0.01 } }),
+    ];
+    // round 1 over [a, b, c]: a dismissed, b + c upheld
+    const { calls, fn } = scripted([
+      j({ defense: 'd', defense_strength: 'strong' }),
+      j({ verdict: 'dismissed', reason: 'correct as stated' }),
+      ...upheld(0),
+      ...upheld(1),
+      // round 2 over the [b, c] survivors: b dismissed, c upheld again
+      j({ defense: 'd', defense_strength: 'strong' }),
+      j({ verdict: 'dismissed', reason: 'still wrong' }),
+      ...upheld(2),
+    ]);
+    const { kept: out } = await defenseRound({
+      callJson: fn,
+      doc: makeDoc(),
+      candidates: [mk('a'), mk('b'), mk('c')],
+      settings: makeSettings({
+        review: { defenseSecondRound: true, maxParallelCalls: 1 },
+      }),
+    });
+    // only the twice-upheld comment survives
+    expect(out).toHaveLength(1);
+    expect(out[0]!.comment).toBe('c');
+    // round 1: 3 defenses + 3 adjudications; round 2: 2 defenses + 2
+    // adjudications
+    expect(calls).toHaveLength(10);
+  });
 });
 
 // ---------------------------------------------------------------- passageFor --
@@ -634,5 +721,79 @@ describe('passageFor', () => {
     const doc = makeDoc();
     expect(passageFor(doc, '')).toBeNull();
     expect(passageFor(doc, 'not present anywhere at all')).toBeNull();
+  });
+});
+
+// ------------------------------------------- provenance re-attachment (7d) --
+// Pin of Python test_reattach_provenance_matching_tiers (9a40f13): exact
+// normalized quote wins, anchor match second, title+message similarity third;
+// existing provenance is never overwritten; unmatched comments stay untagged.
+
+describe('reattachProvenance matching tiers', () => {
+  it('exact quote, then anchor, then similarity; never overwrites', () => {
+    const sources = [
+      {
+        title: 'Bad total',
+        quote: 'the total is 480 items',
+        paragraph_anchor: 'Table 1 shows counts.',
+        provenance: 'deterministic',
+      },
+      {
+        title: 'Unproven theorem',
+        quote: 'every widget is stable',
+        paragraph_anchor: 'Theorem 1 states stability.',
+        provenance: 'claim_verify 2-of-2',
+      },
+      {
+        title: 'Sign error in Lemma 2',
+        quote: '',
+        paragraph_anchor: '',
+        message: 'The inequality direction flips under the stated assumptions.',
+        provenance: 'claim_verify 1-of-2 + arbitrated',
+      },
+    ];
+    const final: Record<string, unknown>[] = [
+      // exact quote match (whitespace drift tolerated by _norm)
+      { title: 'reworded', quote: 'The  total is 480 items' },
+      // anchor match
+      {
+        title: 'reworded 2',
+        quote: '',
+        paragraph_anchor: 'Theorem 1 states stability.',
+      },
+      // only similarity can find this one (message nearly identical)
+      {
+        title: 'Sign error in Lemma 2 (adjusted)',
+        quote: '',
+        paragraph_anchor: '',
+        message: 'The inequality direction flips under the stated assumptions here.',
+      },
+      // nothing matches, and one that already has provenance
+      { title: 'orphan' },
+      { title: 'keep me', quote: 'x', provenance: 'already-there' },
+    ];
+    reattachProvenance(final, sources);
+    expect(final[0]!['provenance']).toBe('deterministic');
+    expect(final[1]!['provenance']).toBe('claim_verify 2-of-2');
+    expect(final[2]!['provenance']).toBe('claim_verify 1-of-2 + arbitrated');
+    expect('provenance' in final[3]!).toBe(false);
+    expect(final[4]!['provenance']).toBe('already-there');
+  });
+
+  it('no provenance-bearing sources: no-op', () => {
+    const final: Record<string, unknown>[] = [{ title: 'x' }];
+    reattachProvenance(final, [{ title: 'y' }]);
+    expect('provenance' in final[0]!).toBe(false);
+  });
+});
+
+// ------------------------------------------------- meta input cap (7d) --
+// Python: json.dumps(merged, indent=1)[: max(100_000, 900 * n_comments)] —
+// the 7c review P3 divergence (fixed TS 60_000 slice) closes here.
+
+describe('meta input cap scales with comment count', () => {
+  it('uses max(100_000, 900*n) — above and below the static floor', () => {
+    expect(metaCommentsJsonCap(10)).toBe(100_000);
+    expect(metaCommentsJsonCap(200)).toBe(180_000);
   });
 });

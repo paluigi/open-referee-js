@@ -101,8 +101,13 @@ describe('UsageLedger.record and aggregation', () => {
       role: 'strong',
       usage: { promptTokens: 1_000_000, completionTokens: 250_000 },
       costUsd: 4,
+      // 7c: the budget harness keys per-phase accounting on the call type.
+      callType: 'other',
     });
     expect(ledger.calls).toEqual([rec]);
+    // explicit call types tag through (Python complete_json(call_type=...))
+    const tagged = ledger.record('gpt-strong', 'strong', resp(10, 10), 'meta');
+    expect(tagged.callType).toBe('meta');
   });
 
   it('totalCost and totalTokens aggregate across calls', () => {

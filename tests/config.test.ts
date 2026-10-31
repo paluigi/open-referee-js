@@ -124,6 +124,87 @@ describe('mergeSettings', () => {
       DEFAULT_SETTINGS.searchOrder,
     );
   });
+
+  it('round-trips the Stage-7c budget tier block (universal rule)', () => {
+    const budget = { depth: 'auto', budgetUsd: 12.5 };
+    expect(mergeSettings({ budget }).budget).toEqual(budget);
+    // unknown depth / wrong-typed figures dropped
+    expect(
+      mergeSettings({ budget: { depth: 'turbo', budgetUsd: 'five' } }).budget,
+    ).toEqual({});
+    expect(mergeSettings({ budget: 'fast' }).budget).toBeUndefined();
+    expect(mergeSettings({ budget: { depth: 'fast', budgetUsd: 0 } }).budget).toEqual({
+      depth: 'fast',
+      budgetUsd: 0,
+    });
+    // absent budget stays absent (defaults apply at use time)
+    expect(mergeSettings({}).budget).toBeUndefined();
+  });
+
+  it('round-trips the Stage-7e optional decision role (universal rule)', () => {
+    const role = { provider: 'fakedec', model: 'decider-fake' };
+    expect(mergeSettings({ decisionRole: role }).decisionRole).toEqual(role);
+    // temperature/maxTokens ride along when well-typed
+    expect(
+      mergeSettings({
+        decisionRole: { ...role, temperature: 0.2, maxTokens: 512 },
+      }).decisionRole,
+    ).toEqual({ ...role, temperature: 0.2, maxTokens: 512 });
+    // half-bound role (missing model) is not a role
+    expect(
+      mergeSettings({ decisionRole: { provider: 'fakedec' } }).decisionRole,
+    ).toBeUndefined();
+    // non-object / wrong-typed fields dropped
+    expect(mergeSettings({ decisionRole: 'decider' }).decisionRole).toBeUndefined();
+    expect(
+      mergeSettings({
+        decisionRole: { provider: 'fakedec', model: 'm', temperature: 'warm' },
+      }).decisionRole,
+    ).toEqual({ provider: 'fakedec', model: 'm' });
+    // absent decision role stays absent (DM layer dormant)
+    expect(mergeSettings({}).decisionRole).toBeUndefined();
+  });
+
+  it('round-trips the 7c PlanKnob overrides on the review block', () => {
+    const review = {
+      recompute: false,
+      verifyPasses: 3,
+      claimRouting: 'all_strong',
+      outputBudget: 'high',
+      synthesis: false,
+      copyedit: false,
+      defenseSecondRound: true,
+    };
+    expect(mergeSettings({ review }).review).toEqual(review);
+    // invalid enum values dropped
+    expect(
+      mergeSettings({ review: { claimRouting: 'mega', outputBudget: 'max' } }).review,
+    ).toEqual({});
+  });
+
+  it('round-trips the 7d review supportsReasoning role flag (universal rule)', () => {
+    // boolean rides the role block
+    expect(
+      mergeSettings({
+        roles: { strong: { provider: 'p', model: 'm', supportsReasoning: true } },
+      }).roles.strong,
+    ).toEqual({ provider: 'p', model: 'm', supportsReasoning: true });
+    // non-boolean values are DROPPED (universal rule) — flag stays absent
+    expect(
+      mergeSettings({
+        roles: { strong: { provider: 'p', model: 'm', supportsReasoning: 'yes' } },
+      }).roles.strong,
+    ).toEqual({ provider: 'p', model: 'm' });
+    expect(
+      mergeSettings({
+        roles: { small: { provider: 'p', model: 'm', supportsReasoning: 1 } },
+      }).roles.small,
+    ).toEqual({ provider: 'p', model: 'm' });
+    // absent flag stays absent (default false = single-call path)
+    expect(
+      mergeSettings({ roles: { vision: { provider: 'p', model: 'm' } } }).roles.vision,
+    ).toEqual({ provider: 'p', model: 'm' });
+  });
 });
 
 describe('storage roundtrip', () => {

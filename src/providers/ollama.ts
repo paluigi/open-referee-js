@@ -75,6 +75,7 @@ export class OllamaProvider {
       maxRetries: this.maxRetries,
       timeoutMs: this.timeoutMs,
       sleep: this.sleep,
+      label: 'ollama',
     };
 
     const res = await retryFetch(retryArgs);

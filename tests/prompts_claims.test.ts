@@ -20,26 +20,8 @@ import {
 // char-for-char: the TS template literals must reproduce the Python runtime
 // values exactly, including the %PLACEHOLDER% replacement mechanics.
 
-const PY_CLAIM_INVENTORY_SYSTEM = `You are the CLAIM CATALOGUER for a rigorous peer review. Read the manuscript and produce an exhaustive inventory of ATOMICALLY CHECKABLE claims. A good claim is one whose verification needs no other context than the claim itself plus the definitions it references.
-
-Claim types:
-- theorem_proof: a theorem/lemma/proposition with its proof — the claim is "the proof establishes the statement" (give statement and proof verbatim)
-- equation: a displayed or inline derivation — "this equality/inequality follows from the preceding steps under the stated assumptions"
-- numerical: a stated number (coefficient, sample size, magnitude, percentage, date) that can be checked against the paper's tables or text
-- table_text: a table plus a prose passage discussing it — "the prose accurately describes the table" (give both)
-- figure_text: a figure plus the prose/caption discussing it — same contract
-- citation_claim: an in-text citation plus the claim attached to it — "the cited work supports the claim"
-- cross_reference: a reference to another part of the paper ("as shown in Table 4", "see Section 7", "as proved in Lemma 2") — "the target exists and says what is claimed"
-- assumption_use: a stated assumption and a later step relying on it — "the step respects the assumption"
-- logical: any other proposition the prose asserts as following from earlier content
-
-Rules:
-- One claim per item; do not bundle independent assertions.
-- Include the exact verbatim text of each component in the claim fields.
-- Prioritize claims that MATTER: central results first, load-bearing steps, headline numbers. For a long paper, exhaust the important claims before the peripheral ones.
-- Do not judge the claims; only catalogue them.
-
-Return STRICT JSON: {"claims": [{"id": "cl01", "type": "<one of the types>", "importance": "central|supporting|peripheral", "components": {"<free keys per type, e.g. statement, proof, equation, left_side, right_side, table, prose, citation, claim, target, passage>": "<verbatim text>"}, "anchor": "verbatim sentence from the manuscript this claim attaches to", "section": "section title"}]}`;
+const PY_CLAIM_INVENTORY_SYSTEM =
+  'You are the CLAIM CATALOGUER for a rigorous peer review. Read the manuscript and produce an exhaustive inventory of ATOMICALLY CHECKABLE claims. A good claim is one whose verification needs no other context than the claim itself plus the definitions it references.\n\nClaim types:\n- theorem_proof: a theorem/lemma/proposition with its proof — the claim is "the proof establishes the statement" (give statement and proof verbatim)\n- equation: a displayed or inline derivation — "this equality/inequality follows from the preceding steps under the stated assumptions"\n- numerical: a stated number (coefficient, sample size, magnitude, percentage, date) that can be checked against the paper\'s tables or text\n- table_text: a table plus a prose passage discussing it — "the prose accurately describes the table" (give both)\n- figure_text: a figure plus the prose/caption discussing it — same contract\n- citation_claim: an in-text citation plus the claim attached to it — "the cited work supports the claim"\n- cross_reference: a reference to another part of the paper ("as shown in Table 4", "see Section 7", "as proved in Lemma 2") — "the target exists and says what is claimed"\n- assumption_use: a stated assumption and a later step relying on it — "the step respects the assumption"\n- logical: any other proposition the prose asserts as following from earlier content\n\nRules:\n- One claim per item; do not bundle independent assertions.\n- Include the exact verbatim text of each claim\'s components in the claim fields.\n- Prioritize claims that MATTER: central results first, load-bearing steps, headline numbers. For a long paper, exhaust the important claims before the peripheral ones.\n- Do not judge the claims; only catalogue them.\n\nCoverage duties (do not skip these claim families):\n- Overclaims and hedge removals: sentences asserting a property "for all", "always", "trivial", "any dataset", "no risk remains" — catalogue the asserted scope as a logical claim; the assertion itself is checkable.\n- Significance statements: "significant at the X percent level (p = ...)" — catalogue the pair (level, p-value) as a numerical claim.\n- Figure/table descriptions in prose AND captions: catalogue both sides (what the prose says the artifact shows, what the caption says) so the pair can be compared.\n- Table-prose comparisons: every sentence asserting which category/row is largest, smallest, best, or dominant relative to a table is a table_text claim.\nThese families matter even when the sentence looks minor: false small claims are exactly what a referee must catch.\n\nReturn STRICT JSON: {"claims": [{"id": "cl01", "type": "<one of the types>", "importance": "central|supporting|peripheral", "components": {"<free keys per type, e.g. statement, proof, equation, left_side, right_side, table, prose, citation, claim, target, passage>": "<verbatim text>"}, "anchor": "verbatim sentence from the manuscript this claim attaches to", "section": "section title"}]}';
 
 const PY_CLAIM_INVENTORY_USER = `Manuscript title: Test Paper
 
@@ -145,10 +127,10 @@ Severity rubric: 0.80-1.00 invalidates a result/claim as stated; 0.60-0.79 major
 
 You are the FIGURE_TEXT VERIFICATION WORKER. You receive exactly ONE atomic claim from the manuscript (plus only the definitions it references). Your job: verify THIS claim with full attention. Do not comment on anything outside the claim.
 
-Compare the figure/caption and the prose:
-- Does the prose describe what the figure actually shows (variables, directions, levels, trends, breakpoints)?
-- Does the caption match the plotted content (axes, units, panels, legend)?
-- Any mismatch between prose claims ("the line crosses zero at x=2") and what the figure shows?
+Compare the figure/caption and the prose as a PAIR of descriptions:
+- State precisely what the caption says is plotted (variables, dimension or conditioning: by class, over time, per period) and what the referencing prose says the figure shows. If the two describe different content — a different variable, a different axis or dimension, different conditions, or a different grouping — flag the CONTRADICTION explicitly, quoting both the caption and the prose sentence in the same comment. Do NOT soften a caption-prose contradiction into a complaint about missing detail, verifiability, or figure numbering; those are different (lesser) findings.
+- A caption describing different content than the referencing prose is a substantive consistency error: use category "consistency", not "clarity".
+- If the figure image is provided, also check prose claims ("the line crosses zero at x=2") against the plotted values (directions, magnitudes, crossings, breakpoints, trends), and the caption against the actual axes, units, panels, and legend.
 
 You may use the definitions pack provided — nothing else is guaranteed. If verification is impossible without missing context, return a comment of category "clarity" saying exactly what is missing (that itself is a finding).
 

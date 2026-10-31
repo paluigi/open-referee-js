@@ -8,6 +8,8 @@
 /** One grounded criticism. severity: 0.0 (polish) .. 1.0 (result-invalidating). */
 export interface ReviewComment {
   id?: string;
+  /** short imperative problem statement (Python ReviewComment.title) */
+  title?: string;
   section: string;
   /** exact manuscript span the comment attaches to */
   quote: string;
@@ -25,6 +27,24 @@ export interface ReviewComment {
   artifactId?: string;
   /** math|consistency|evidence|references|clarity|novelty|statistical|other */
   category?: string;
+  /**
+   * How the comment was produced: 'deterministic' for code-verified findings
+   * (doi-resolution; 7b adds the full checkers). Python models carry the
+   * same optional field.
+   */
+  provenance?: string;
+}
+
+/** One language-mechanics fix from the copyedit stage (Python CopyeditItem). */
+export interface CopyeditItem {
+  /** verbatim manuscript span (verified to appear in the document) */
+  quote: string;
+  /** the corrected or reworked phrase */
+  suggestion: string;
+  /** typo | grammar | phrasing | terminology */
+  kind: string;
+  /** section title of the resolved block, when one exists */
+  section?: string | null;
 }
 
 export interface UsageSummary {
@@ -49,6 +69,8 @@ export interface ReviewReport {
   /** meta-review markdown (the report body) */
   overall: string;
   comments: ReviewComment[];
+  /** Language-mechanics annex (copyedit stage); optional, additive. */
+  copyeditItems?: CopyeditItem[];
   usage: UsageSummary;
   /** true when the pipeline stopped early (failed stage / budget cap) */
   partial: boolean;

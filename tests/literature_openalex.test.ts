@@ -138,3 +138,71 @@ describe('OpenAlexClient (scripted fetch, no network)', () => {
     }
   });
 });
+
+// ------------------------------------- polite-pool email env fallbacks (7d) --
+// Python 7949c40: OpenAlex REST queries append mailto alongside api_key;
+// the email resolves explicit -> OPENALEX_EMAIL -> shared EMAIL.
+
+describe('OpenAlex polite-pool email fallback (7949c40)', () => {
+  const ENV_KEYS = ['OPENALEX_EMAIL', 'EMAIL'] as const;
+  const saved: Record<string, string | undefined> = {};
+  const grabEnv = (): Record<string, string | undefined> | undefined => {
+    try {
+      return typeof process !== 'undefined' ? process.env : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  function setEnv(values: Partial<Record<(typeof ENV_KEYS)[number], string>>): void {
+    const env = grabEnv();
+    if (!env) return;
+    for (const k of ENV_KEYS) {
+      saved[k] = env[k];
+      if (k in values) env[k] = values[k];
+      else delete env[k];
+    }
+  }
+
+  function restoreEnv(): void {
+    const env = grabEnv();
+    if (!env) return;
+    for (const k of ENV_KEYS) {
+      if (saved[k] === undefined) delete env[k];
+      else env[k] = saved[k];
+    }
+  }
+
+  afterEach(restoreEnv);
+
+  it('mailto rides alongside api_key on search and DOI lookups', async () => {
+    setEnv({ OPENALEX_EMAIL: 'oa@example.org' });
+    const { calls, restore } = stubFetch(() => ({
+      ok: true,
+      json: { results: [WORK] },
+    }));
+    try {
+      const client = new OpenAlexClient({ apiKey: 'key-1' });
+      await client.searchWorks('attention', 5);
+      expect(calls[0]).toContain('api_key=key-1');
+      expect(calls[0]).toContain('mailto=oa%40example.org');
+    } finally {
+      restore();
+    }
+  });
+
+  it('no email anywhere: no mailto param (browser story)', async () => {
+    setEnv({});
+    const { calls, restore } = stubFetch(() => ({
+      ok: true,
+      json: { results: [WORK] },
+    }));
+    try {
+      const client = new OpenAlexClient();
+      await client.searchWorks('attention', 5);
+      expect(calls[0]).not.toContain('mailto=');
+    } finally {
+      restore();
+    }
+  });
+});

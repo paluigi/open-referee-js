@@ -117,6 +117,27 @@ export function renderPack(
   return parts.join('\n');
 }
 
+/**
+ * Python `ContextPack.model_validate(pack)` (ed1d8da): resumed runs load
+ * stage artifacts as JSON, so every ContextPack consumer must receive a real
+ * pack — validate the persisted artifact back into the ContextPack shape,
+ * defaulting every field (items/bibChecks/userDocs arrays, paperTitle).
+ * Returns undefined when the artifact is not a pack-shaped object.
+ */
+export function contextPackFromArtifact(raw: unknown): ContextPack | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const o = raw as Record<string, unknown>;
+  const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+  return {
+    paperTitle: typeof o['paperTitle'] === 'string' ? o['paperTitle'] : '',
+    paperAbstract: typeof o['paperAbstract'] === 'string' ? o['paperAbstract'] : null,
+    fieldHint: typeof o['fieldHint'] === 'string' ? o['fieldHint'] : null,
+    items: arr(o['items']) as LiteratureItem[],
+    bibChecks: arr(o['bibChecks']) as BibEntryCheck[],
+    userDocs: arr(o['userDocs']) as string[],
+  };
+}
+
 /** Python `re.sub(r'\W+', '', title.lower())[:80]` — the dedupe key. */
 export function normalizeTitleKey(title: string): string {
   return title.toLowerCase().replace(/\W+/g, '').slice(0, 80);

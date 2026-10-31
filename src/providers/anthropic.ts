@@ -89,6 +89,7 @@ export class AnthropicProvider {
       maxRetries: this.maxRetries,
       timeoutMs: this.timeoutMs,
       sleep: this.sleep,
+      label: 'anthropic',
     };
 
     const res = await retryFetch(retryArgs);

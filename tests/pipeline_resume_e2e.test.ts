@@ -269,9 +269,12 @@ describe('resume e2e: interrupt after challenge, resume completes', () => {
     const strong3 = new ScriptedProvider();
     strong3.queue(
       // resume re-enters mid-challenge is impossible (artifact saved) —
-      // the ONLY strong calls are meta (+ validator if candidates exist;
-      // none do here)
+      // the ONLY strong calls are meta + synthesis (7f). e2ba304 (7R F1):
+      // validate no longer runs merely because checker findings exist —
+      // it needs LLM candidates, and challengeValidated here is empty, so
+      // validate SKIPS and no validator reply is consumed.
       j({ overall_feedback: 'resumed report', recommendation: 'minor revision' }),
+      j({ overall_feedback: 'synth over resumed report' }),
     );
     const small3 = new ScriptedProvider();
     small3.queue(
@@ -280,6 +283,9 @@ describe('resume e2e: interrupt after challenge, resume completes', () => {
         in_text_issues: [{ citation: 'Smith (2001)', verdict: 'supported' }],
         missing_key_references: [],
       }),
+      // copyedit annex — resume continues after validate; the artifact was
+      // never persisted pre-interrupt, so the stage runs once here
+      j({ items: [] }),
     );
     const { state } = await drain(
       runReview({
@@ -290,9 +296,11 @@ describe('resume e2e: interrupt after challenge, resume completes', () => {
       }),
     );
 
-    // earlier stages NOT re-called: meta only on strong, bibliography only on small
-    expect(strong3.calls).toHaveLength(1);
-    expect(small3.calls).toHaveLength(1);
+    // earlier stages NOT re-called: meta + synthesis only on strong
+    // (validate skips — no LLM candidates post-e2ba304); bibliography +
+    // copyedit only on small
+    expect(strong3.calls).toHaveLength(2);
+    expect(small3.calls).toHaveLength(2);
     expect(small3.calls[0]!.messages[0]!.content).toBe(bibliographySystem);
     // meta got the bib summary wired into the bibSummary slot
     const metaUser = strong3.calls[0]!.messages[1]!.content;
@@ -301,7 +309,7 @@ describe('resume e2e: interrupt after challenge, resume completes', () => {
     // run completed and the report assembled
     expect(state.stages['assemble']).toBe('done');
     const report = state.report as import('../src/report/models').ReviewReport;
-    expect(report.overall).toBe('resumed report');
+    expect(report.overall).toBe('synth over resumed report');
     expect(state.partial).toBe(false);
   });
 
@@ -349,8 +357,10 @@ describe('resume e2e: interrupt after challenge, resume completes', () => {
     const small = new ScriptedProvider();
     small.queue(
       j({ selected: [], state_of_the_art_notes: '', missing_references: [] }),
-      // lenses: 'none' density/stats + 'formal' style -> prose + lit only
-      // (no math/empirical), 2 lenses x 2 sections = 4 responses
+      // lenses: 'none' density/stats + 'formal' style -> prose + lit +
+      // clarity (7f: clarity always runs), 3 lenses x 2 sections = 6 responses
+      j({ comments: [] }),
+      j({ comments: [] }),
       j({ comments: [] }),
       j({ comments: [] }),
       j({ comments: [] }),
@@ -400,6 +410,8 @@ describe('resume e2e: interrupt after challenge, resume completes', () => {
       j({ verdict: 'upheld' }),
       // meta
       j({ overall_feedback: 'survived resume', recommendation: 'accept' }),
+      // synthesis (7f)
+      j({ overall_feedback: 'synth after resume' }),
       // validator
       j({ validated: [0], rejected: [] }),
     );
@@ -411,6 +423,7 @@ describe('resume e2e: interrupt after challenge, resume completes', () => {
         in_text_issues: [],
         missing_key_references: [],
       }),
+      j({ items: [] }), // copyedit annex
     );
     const { state } = await drain(
       runReview({
@@ -430,8 +443,8 @@ describe('resume e2e: interrupt after challenge, resume completes', () => {
         ),
       ),
     ).toBe(true);
-    expect(strong2.calls).toHaveLength(6); // 3 challenge + defense + meta + validate
-    expect(small2.calls).toHaveLength(2); // defense + bibliography
+    expect(strong2.calls).toHaveLength(7); // 3 challenge + defense + meta + synthesis + validate
+    expect(small2.calls).toHaveLength(3); // defense + bibliography + copyedit
     expect(state.stages['assemble']).toBe('done');
     const report = state.report as import('../src/report/models').ReviewReport;
     expect(report.comments.map((c) => c.comment)).toContain(
@@ -456,8 +469,12 @@ describe('resume e2e: interrupt after challenge, resume completes', () => {
       j({ validated: [], new_comments: [] }),
       j({ validated: [], new_comments: [] }),
       j({ validated: [], new_comments: [] }),
-      // meta (validate never reached — that's the interruption point)
+      // meta → synthesis (7f) → validate over the merged checker stream
+      // (7f: deterministic findings make validate run even with no LLM
+      // candidates). Copyedit announcing itself is the interruption point.
       j({ overall_feedback: 'THE META VERDICT', recommendation: 'minor revision' }),
+      j({ overall_feedback: 'THE SYNTH ESSAY' }),
+      j({ rejected: [], comments: [] }),
     );
     const small = new ScriptedProvider();
     small.queue(
@@ -477,7 +494,10 @@ describe('resume e2e: interrupt after challenge, resume completes', () => {
     for (;;) {
       const next = await gen.next();
       if (next.done) break;
-      if (next.value.stage === 'validate' && next.value.status === 'running') {
+      // Interrupt when COPYEDIT announces itself: with a claimless fixture
+      // validate is skipped (no candidates), so copyedit is the first stage
+      // after meta to announce 'running' — meta is done + persisted there.
+      if (next.value.stage === 'copyedit' && next.value.status === 'running') {
         await gen.return(undefined as unknown as RunState);
         break;
       }
@@ -489,11 +509,12 @@ describe('resume e2e: interrupt after challenge, resume completes', () => {
     const resumeState = await loadRun(saved!.runId);
 
     const strong2 = new ScriptedProvider();
-    strong2.queue(
-      // ONLY the validator runs (meta skipped: draft restored, no re-call)
-      j({ validated: [0], rejected: [] }),
-    );
+    // the claimless claims stage FAILED pre-interrupt → it re-runs on resume
+    // (stage-failure semantics), then validate re-runs?? no — validate is
+    // done. Only claims + its downstream nothing: claims re-inventories.
+    strong2.queue(j({ claims: [] }));
     const small2 = new ScriptedProvider();
+    small2.queue(j({ items: [] })); // copyedit annex (never ran pre-interrupt)
     const { state } = await drain(
       runReview({
         doc: makeDoc(),
@@ -502,12 +523,91 @@ describe('resume e2e: interrupt after challenge, resume completes', () => {
         resume: { state: resumeState! },
       }),
     );
-    expect(strong2.calls).toHaveLength(1); // validator only — meta NOT re-called
-    expect(small2.calls).toHaveLength(0);
+    // the re-run claims inventory + nothing else (meta/synthesis/validate
+    // are all restored; claims re-runs because it FAILED pre-interrupt)
+    expect(strong2.calls).toHaveLength(1);
+    expect(small2.calls).toHaveLength(1); // copyedit annex only
     const report = state.report as import('../src/report/models').ReviewReport;
-    expect(report.overall).toBe('THE META VERDICT');
+    expect(report.overall).toBe('THE SYNTH ESSAY');
     // NB: partial is true here — the claimless fixture marks the claims stage
     // 'failed or produced no claims' in BOTH attempts (asserted above).
+  });
+});
+
+describe('copyedit artifact contract', () => {
+  it('resume with the copyedit artifact persisted does NOT re-call copyedit', async () => {
+    // Run to completion once (copyedit returns one real item).
+    const strong = new ScriptedProvider();
+    strong.queue(
+      j({
+        mathematical_density: 'none',
+        statistical_content: 'none',
+        methodological_style: 'formal',
+        summary: 's',
+      }),
+      j({ claims: [] }),
+      j({ validated: [], new_comments: [] }),
+      j({ validated: [], new_comments: [] }),
+      j({ validated: [], new_comments: [] }),
+      j({ overall_feedback: 'done once' }),
+      j({ overall_feedback: 'done once (synth)' }),
+      j({ rejected: [], comments: [] }), // validate over the merged checker stream (7f)
+    );
+    const small = new ScriptedProvider();
+    small.queue(
+      j({ selected: [], state_of_the_art_notes: '', missing_references: [] }),
+      j({
+        entries: [{ raw_entry: '[1] Smith, J. (2001)', status: 'verified' }],
+        in_text_issues: [],
+        missing_key_references: [],
+      }),
+      j({
+        items: [
+          {
+            quote: 'Standard errors are computed by bootstrap',
+            suggestion: 'Standard errors are computed via the bootstrap',
+            kind: 'phrasing',
+          },
+        ],
+      }),
+    );
+    const { state } = await drain(
+      runReview({
+        doc: makeDoc(),
+        settings: makeSettings(),
+        providers: { strong, small },
+      }),
+    );
+    expect(state.stages['copyedit']).toBe('done');
+    const report = state.report as import('../src/report/models').ReviewReport;
+    expect(report.copyeditItems).toHaveLength(1);
+
+    // Resume the COMPLETED run: every stage re-enters as done-with-artifact
+    // (the copyedit artifact included) — no provider call may happen at all.
+    // NB: the claims stage is 'failed' here (empty inventory fixture), and a
+    // failed stage legitimately re-runs on resume — so give it one response;
+    // the assertion below is that COPYEDIT is not re-called.
+    const resumeState = await loadRun(state.runId);
+    const strong2 = new ScriptedProvider();
+    strong2.queue(
+      j({ claims: [] }), // claims re-run (failed stage), everything else skips
+    );
+    const small2 = new ScriptedProvider();
+    const { state: state2 } = await drain(
+      runReview({
+        doc: makeDoc(),
+        settings: makeSettings(),
+        providers: { strong: strong2, small: small2 },
+        resume: { state: resumeState! },
+      }),
+    );
+    // copyedit NOT re-called despite the resume re-running earlier stages.
+    expect(small2.calls).toHaveLength(0);
+    expect(state2.stages['copyedit']).toBe('done');
+    expect(state2.report).toBeDefined();
+    expect(
+      (state2.report as import('../src/report/models').ReviewReport).copyeditItems,
+    ).toHaveLength(1);
   });
 });
 

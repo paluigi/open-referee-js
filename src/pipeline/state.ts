@@ -17,6 +17,7 @@ export type Stage =
   | 'bibliography'
   | 'meta'
   | 'validate'
+  | 'copyedit'
   | 'assemble';
 
 export type StageStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
@@ -42,6 +43,8 @@ export type StageArtifacts = {
   bibliography?: unknown;
   /** meta output: overall_feedback + recommendation (Python draft_review). */
   draftReview?: { overall: string; recommendation?: string };
+  /** copyedit-stage output: sanitized language-mechanics items. */
+  copyeditItems?: unknown[];
 };
 
 export interface RunState {
@@ -51,6 +54,10 @@ export interface RunState {
   stages: Partial<Record<Stage, StageStatus>>;
   /** Full event log, persisted so finished runs can replay them. */
   events: StageEvent[];
+  /** Deterministic DOI-resolution records (bibliography-stage input). */
+  doiResolutions?: unknown[];
+  /** Deterministic checker findings (doi-resolution; 7b adds the rest). */
+  checkerFindings?: Record<string, unknown>[];
   /** Final ReviewReport (assembled by the orchestrator), when reached. */
   report?: unknown;
   /** Per-stage artifacts for resume (see StageArtifacts). */
@@ -59,6 +66,28 @@ export interface RunState {
   docData?: unknown;
   /** True when any stage failed or was skipped: the report is incomplete. */
   partial: boolean;
+  /**
+   * Persisted budget state (Stage 7c; Python state.plan + state.ledger_calls):
+   * the harness's current plan and every booked call record, so a resumed
+   * run keeps its spend accounting and continues from the failure point
+   * after a top-up (budget raise).
+   */
+  plan?: unknown;
+  ledgerCalls?: {
+    /** model id (added 7c-review: needed to re-book records on resume). */
+    model?: string;
+    role: string;
+    callType: string;
+    inputTokens: number;
+    outputTokens: number;
+    costUsd: number;
+  }[];
+  /**
+   * Estimated additional budget needed to finish (7e review B4; Python
+   * state.shortfall_usd) — set when no continuation plan is feasible and the
+   * run wraps up incomplete.
+   */
+  shortfallUsd?: number;
   /** ISO 8601 timestamps. */
   startedAt: string;
   updatedAt: string;
@@ -67,8 +96,8 @@ export interface RunState {
 /**
  * Canonical stage order (Python: ingest -> triage -> claims -> survey ->
  * scout -> verify -> challenge -> bibliography -> meta -> validate ->
- * assemble). Old persisted runs with the previous 6-, 8- or 9-stage shapes
- * stay readable: `stages` is Partial.
+ * copyedit -> assemble). Old persisted runs with the previous 6-, 8-, 9- or
+ * 10-stage shapes stay readable: `stages` is Partial.
  */
 export const STAGES: readonly Stage[] = [
   'triage',
@@ -80,6 +109,7 @@ export const STAGES: readonly Stage[] = [
   'bibliography',
   'meta',
   'validate',
+  'copyedit',
   'assemble',
 ];
 
@@ -168,6 +198,9 @@ function stageHasArtifact(a: StageArtifacts, stage: Stage): boolean {
       // Draft review (overall/recommendation) is the meta output
       // (Python artifacts['draft_review']).
       return a.draftReview !== undefined;
+    case 'copyedit':
+      // Copyedit items are the stage output (Python artifacts['copyedit_items']).
+      return a.copyeditItems !== undefined;
     default:
       // scout/validate persist no artifact: done means done.
       return true;

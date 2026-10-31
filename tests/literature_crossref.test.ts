@@ -3,6 +3,7 @@ import {
   CrossrefClient,
   crossrefItemToLiteratureItem,
 } from '../src/literature/crossref';
+import { resolvePolitePoolEmail } from '../src/literature/openalex';
 
 const ITEM = {
   title: ['Deep Residual Learning for Image Recognition'],
@@ -118,6 +119,86 @@ describe('CrossrefClient (scripted fetch, no network)', () => {
       expect(warn).toHaveBeenCalledTimes(2);
     } finally {
       cors.restore();
+    }
+  });
+});
+
+// ------------------------------------- polite-pool email env fallbacks (7d) --
+// Pin of Python test_literature_wiring.py (7949c40): the polite-pool email
+// resolves explicit -> CROSSREF_EMAIL -> shared EMAIL; requests carry
+// mailto exactly when an email resolves.
+
+describe('Crossref polite-pool email fallback (7949c40)', () => {
+  const ENV_KEYS = ['CROSSREF_EMAIL', 'EMAIL'] as const;
+  const saved: Record<string, string | undefined> = {};
+  const grabEnv = (): Record<string, string | undefined> | undefined => {
+    try {
+      return typeof process !== 'undefined' ? process.env : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  function setEnv(values: Partial<Record<(typeof ENV_KEYS)[number], string>>): void {
+    const env = grabEnv();
+    if (!env) return;
+    for (const k of ENV_KEYS) {
+      saved[k] = env[k];
+      if (k in values) env[k] = values[k];
+      else delete env[k];
+    }
+  }
+
+  function restoreEnv(): void {
+    const env = grabEnv();
+    if (!env) return;
+    for (const k of ENV_KEYS) {
+      if (saved[k] === undefined) delete env[k];
+      else env[k] = saved[k];
+    }
+  }
+
+  afterEach(restoreEnv);
+
+  it('explicit option wins; env fallbacks apply when no option is given', () => {
+    setEnv({ CROSSREF_EMAIL: 'cfg@example.org', EMAIL: 'shared@example.org' });
+    expect(resolvePolitePoolEmail('explicit@example.org', 'CROSSREF_EMAIL')).toBe(
+      'explicit@example.org',
+    );
+    expect(resolvePolitePoolEmail(undefined, 'CROSSREF_EMAIL')).toBe('cfg@example.org');
+    setEnv({ EMAIL: 'shared@example.org' });
+    expect(resolvePolitePoolEmail(undefined, 'CROSSREF_EMAIL')).toBe(
+      'shared@example.org',
+    );
+    setEnv({});
+    expect(resolvePolitePoolEmail(undefined, 'CROSSREF_EMAIL')).toBeUndefined();
+  });
+
+  it('outgoing lookup carries mailto only when an email resolves', async () => {
+    setEnv({ EMAIL: 'shared@example.org' });
+    const { calls, restore } = stubFetch(() => ({
+      ok: true,
+      json: { message: { items: [ITEM] } },
+    }));
+    try {
+      const client = new CrossrefClient();
+      await client.lookup('A title');
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!).toContain('mailto=shared%40example.org');
+    } finally {
+      restore();
+    }
+    setEnv({});
+    const { calls: calls2, restore: restore2 } = stubFetch(() => ({
+      ok: true,
+      json: { message: { items: [ITEM] } },
+    }));
+    try {
+      const client = new CrossrefClient();
+      await client.lookup('A title');
+      expect(calls2[0]!).not.toContain('mailto=');
+    } finally {
+      restore2();
     }
   });
 });

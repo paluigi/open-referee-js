@@ -90,6 +90,7 @@ export class GeminiProvider {
       maxRetries: this.maxRetries,
       timeoutMs: this.timeoutMs,
       sleep: this.sleep,
+      label: 'gemini',
     };
 
     const res = await retryFetch(retryArgs);

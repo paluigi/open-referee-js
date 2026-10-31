@@ -25,7 +25,7 @@ describe('ProgressController', () => {
     const c = new ProgressController(root);
     const bar = root.querySelector('progress');
     expect(bar).not.toBeNull();
-    expect(root.querySelectorAll('li')).toHaveLength(10);
+    expect(root.querySelectorAll('li')).toHaveLength(11);
     expect(
       root.querySelector<HTMLLIElement>('li[data-stage="triage"]')?.dataset.status,
     ).toBe('pending');

@@ -6,10 +6,17 @@
  * forbid setting User-Agent on fetch, so the TS port uses the `mailto` query
  * parameter instead — Crossref officially supports it for polite-pool access.
  *
+ * Polite pool (7949c40): Python resolves the email from
+ * CrossrefConfig.resolved_email() — explicit config, then CROSSREF_EMAIL,
+ * then the shared EMAIL env var. The TS client mirrors that ladder via
+ * `resolvePolitePoolEmail` where an env exists (Node/tests); in the browser
+ * the field is absent unless the caller passes `mailto`.
+ *
  * Fail-soft like every literature client: any failure -> null + console.warn.
  */
 
 import { type LiteratureItem } from './types';
+import { resolvePolitePoolEmail } from './openalex';
 
 const URL_BASE = 'https://api.crossref.org/works';
 
@@ -46,10 +53,15 @@ export function crossrefItemToLiteratureItem(item: CrossrefItem): LiteratureItem
 }
 
 export class CrossrefClient {
-  private readonly mailto: string | undefined;
+  private readonly explicitMailto: string | undefined;
 
   constructor(opts?: CrossrefOptions) {
-    this.mailto = opts?.mailto;
+    this.explicitMailto = opts?.mailto;
+  }
+
+  /** Resolved polite-pool email: explicit option, then CROSSREF_EMAIL/EMAIL env. */
+  private get mailto(): string | undefined {
+    return resolvePolitePoolEmail(this.explicitMailto, 'CROSSREF_EMAIL');
   }
 
   /** Title lookup (rows=1); `null` on any failure. */
@@ -59,7 +71,8 @@ export class CrossrefClient {
         'query.bibliographic': title,
         rows: '1',
       });
-      if (this.mailto) p.set('mailto', this.mailto);
+      const email = this.mailto;
+      if (email) p.set('mailto', email);
       const r = await fetch(`${URL_BASE}?${p.toString()}`);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const json = (await r.json()) as { message?: { items?: CrossrefItem[] } };

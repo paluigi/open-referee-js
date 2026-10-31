@@ -104,6 +104,8 @@ export async function runBibliographyAudit(init: {
   callJson: CallJson;
   doc: Document;
   pack: ContextPack;
+  /** Deterministic resolution block for the new Python {resolution} slot. */
+  resolution?: string;
   /** Accepted for call-site parity with the other stage runners (unused). */
   settings?: unknown;
 }): Promise<{ audit: BibliographyAudit; budget?: BudgetExceeded }> {
@@ -113,9 +115,16 @@ export async function runBibliographyAudit(init: {
   const user = bibliographyPrompt(
     doc.referencesText.slice(0, 30_000),
     intext.slice(0, 15_000),
+    init.resolution ?? '(resolution unavailable)',
     renderPack(pack, 25),
   );
-  const res = await callJsonWithRepair(callJson, 'small', bibliographySystem, user);
+  const res = await callJsonWithRepair(
+    callJson,
+    'small',
+    bibliographySystem,
+    user,
+    'bibliography',
+  );
   if (res.kind === 'budget') return { audit: emptyAudit(), budget: res.error };
   // Python catches LLMError (which the JSON-repair retry also raises) and
   // continues with the empty audit.

@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { runReview } from '../src/pipeline/orchestrator';
 import type { StageProgress } from '../src/pipeline/orchestrator';
 import type { RunState, StageEvent } from '../src/pipeline/state';
-import { listRuns } from '../src/runs/store';
+import { listRuns, loadRun } from '../src/runs/store';
 import type { Document } from '../src/ingestion/document';
 import { readMarkdown } from '../src/ingestion/readers_md';
 import { DEFAULT_SETTINGS, type AppSettings } from '../src/config/schema';
@@ -183,6 +183,8 @@ describe('runReview happy path', () => {
           '## Weaknesses\n\nThe novelty claim is overstated. Recommend major revision.',
         paper_summary: 's',
       }),
+      // synthesis (7f): essay replaces the merger's overall feedback
+      j({ overall_feedback: '## Synth essay. Recommend major revision.' }),
 
       // validator: keep index 0
       j({ validated: [0], rejected: [], reasons: 'ok' }),
@@ -201,8 +203,18 @@ describe('runReview happy path', () => {
             category: 'statistical',
           },
         ],
+      }), // numerical claim -> small role
+      // copyedit annex (SMALL, after validate): one verbatim fix
+      j({
+        items: [
+          {
+            quote: 'bootstrap with 999 replications',
+            suggestion: 'bootstrap with 1,000 replications',
+            kind: 'Grammar',
+          },
+        ],
       }),
-    ); // numerical claim -> small role
+    );
     const settings = makeSettings();
 
     const progressCalls: (StageProgress | undefined)[] = [];
@@ -227,6 +239,7 @@ describe('runReview happy path', () => {
       'bibliography',
       'meta',
       'validate',
+      'copyedit',
       'assemble',
     ]);
 
@@ -252,22 +265,50 @@ describe('runReview happy path', () => {
     expect(state.partial).toBe(false);
 
     // strong provider: triage, inventory, theorem_proof worker,
-    // 2 section challengers, whole-paper challenger, meta, validator = 8
+    // 2 section challengers, whole-paper challenger, meta, synthesis,
+    // validator = 9
     // (wholePaperPasses=false: no whole-paper VERIFIER; the whole-paper
     // CHALLENGER is part of the challenge stage and always runs. The survey
     // moved to the SMALL role in Stage 5 — Python `_literature` parity.)
-    expect(strong.calls).toHaveLength(8);
+    expect(strong.calls).toHaveLength(9);
+    // 7f: the synthesis call rides the meta stage (callType 'synthesis',
+    // output-budgeted) and its essay REPLACES the merger's overall feedback
+    expect(strong.calls[7]!.spec.maxTokens).toBe(6144);
+    expect(strong.calls[7]!.messages[0]!.content).toContain('LEAD REFEREE');
+    expect(report.overall).toBe('## Synth essay. Recommend major revision.');
     expect(strong.calls[0]!.spec.model).toBe('m-strong');
     expect(strong.calls[0]!.spec.temperature).toBe(0.2);
     expect(strong.calls[0]!.spec.maxTokens).toBe(4096);
-    // small role: surveyor + the numerical claim worker
-    expect(small.calls).toHaveLength(2);
+    // small role: surveyor + the numerical claim worker + copyedit annex
+    expect(small.calls).toHaveLength(3);
     expect(small.calls[0]!.messages[0]!.content).toBe(surveySystem);
     expect(small.calls[1]!.messages[1]!.content).toContain('[cl002]');
+
+    // copyedit items flow into the report annex
+    expect(report.copyeditItems).toEqual([
+      {
+        quote: 'bootstrap with 999 replications',
+        suggestion: 'bootstrap with 1,000 replications',
+        kind: 'grammar',
+        section: 'Methods',
+      },
+    ]);
 
     // verify progress carries unitsDone/unitsTotal per claim
     const progress = progressCalls.filter((p) => p !== undefined);
     expect(progress.some((p) => p!.unitsTotal === 2)).toBe(true);
+
+    // deterministic checkers ran at the verify head (zero LLM cost) — the
+    // fixture has "999 replications" and Section headings, no dangling refs;
+    // the claims inventory ANCHOR "bootstrap with 999 replications" is prose.
+    // The MD fixture has no figure/table/theorem structure -> likely no xref
+    // findings, but the checkerFindings state contract must hold either way.
+    expect(Array.isArray(state.checkerFindings)).toBe(true);
+    const det = state.checkerFindings as Record<string, unknown>[];
+    for (const f of det) {
+      expect(f['provenance']).toBe('deterministic');
+      expect(typeof f['check']).toBe('string');
+    }
 
     // state machine consistency
     expect(state.stages['assemble']).toBe('done');
@@ -298,16 +339,17 @@ describe('runReview budget exhaustion', () => {
     );
 
     expect(state.partial).toBe(true);
-    const report = state.report as import('../src/report/models').ReviewReport;
-    expect(report.partial).toBe(true);
-    expect(report.comments).toHaveLength(0);
-    // triage ran; the claims budget check tripped before any inventory call
-    expect(strong.calls).toHaveLength(1);
+    // 7c: a budget-drained run persists its report for the UI but clears
+    // state.report before the final save — skipped stages must stay
+    // re-enterable for the resumable top-up. The partial report still
+    // reached the caller through the drained generator (assert on stages).
     expect(state.stages['claims']).toBe('failed');
     expect(state.stages['survey']).toBe('skipped');
     expect(state.stages['verify']).toBe('skipped');
     expect(state.stages['meta']).toBe('skipped');
     expect(state.stages['validate']).toBe('skipped');
+    // triage ran; the claims budget check tripped before any inventory call
+    expect(strong.calls).toHaveLength(1);
     // assemble still closes the run out (partial report), so it ends done
     expect(state.stages['assemble']).toBe('done');
   });
@@ -351,6 +393,8 @@ describe('runReview validator filtering', () => {
     // surveyor (SMALL role since Stage 5)
     small.queue(
       j({ selected: [], state_of_the_art_notes: '', missing_references: [] }),
+      // copyedit annex
+      j({ items: [] }),
     );
     const { state } = await drain(
       runReview({
@@ -411,7 +455,8 @@ describe('runReview validator filtering', () => {
         comment: { message: 'adjusted message', score: 0.4 },
       }),
       j({ verdict: 'upheld' }),
-      j({ overall_feedback: 'report' }),
+      j({ overall_feedback: 'report', recommendation: 'minor revision' }),
+      j({ overall_feedback: '## synth' }), // synthesis (7f)
       // validator sees the POST-gate list (2 comments) and keeps both
       j({ validated: [0, 1], rejected: [] }),
     );
@@ -423,8 +468,10 @@ describe('runReview validator filtering', () => {
       j({ defense: 'it is fine', defense_strength: 'strong' }),
       j({ defense: 'overstated', defense_strength: 'weak' }),
       j({ defense: 'no case', defense_strength: 'none' }),
+      // copyedit annex
+      j({ items: [] }),
     );
-    const { state, events } = await drain(
+    const { state } = await drain(
       runReview({
         doc: makeDoc(),
         settings: makeSettings({
@@ -437,42 +484,16 @@ describe('runReview validator filtering', () => {
         providers: { strong, small },
       }),
     );
-    // eslint-disable-next-line no-console
-    console.log(
-      'DBGGATE small calls:',
-      small.calls
-        .map(
-          (c) =>
-            (c.messages[0]!.content.match(
-              /You are the ([A-Z ]+REFEREE|AUTHORS' DEFENSE COUNSEL)/,
-            ) ?? [c.messages[0]!.content.slice(0, 40)])[0],
-        )
-        .join(' >> '),
-    );
-    // eslint-disable-next-line no-console
-    console.log(
-      'DBGGATE events:',
-      events
-        .map((e) => e.stage + ':' + e.status + (e.detail ? ':' + e.detail : ''))
-        .join(' | '),
-    );
     const report = state.report as import('../src/report/models').ReviewReport;
-    // eslint-disable-next-line no-console
-    console.log(
-      'DBGCOMMENTS',
-      report.comments.map((c) => c.comment).join(','),
-      '| severity:',
-      report.comments.map((c) => c.severity).join(','),
-    );
     expect(report.comments.map((c) => c.comment)).toEqual([
       'adjusted message',
       'keep me',
     ]);
     expect(report.comments[0]!.severity).toBe(0.4);
-    // defense on small (3 calls) + the surveyor = 4; adjudication on strong.
-    // The surveyor runs first (survey stage), then the defense gate at the
-    // challenge tail.
-    expect(small.calls).toHaveLength(4);
+    // defense on small (3 calls) + the surveyor + copyedit = 5; adjudication
+    // on strong. The surveyor runs first (survey stage), then the defense
+    // gate at the challenge tail, copyedit after validate.
+    expect(small.calls).toHaveLength(5);
     expect(small.calls[0]!.messages[0]!.content).toBe(surveySystem);
     expect(small.calls[1]!.messages[0]!.content).toContain("AUTHORS' DEFENSE COUNSEL");
   });
@@ -482,20 +503,24 @@ describe('runReview malformed JSON', () => {
   it('fails the stage, sets partial, and still completes the run', async () => {
     const strong = new ScriptedProvider();
     strong.queue(
-      'this is not json at all', // triage: garbage — TS triage/meta/validate use plain callJson (no repair retry); Python repairs there too but TS hasn't since Stage 1 -> failed
+      'this is not json at all', // triage: garbage...
+      'no json here either', // ...repair replay: garbage -> triage failed (7d: repair lives in callJson)
       'no json {{{ here', // inventory: garbage
-      'again {{{ nope', // inventory repair retry: garbage -> claims failed
+      'again {{{ nope', // inventory repair replay: garbage -> claims failed
       // survey now runs on the SMALL role: garbage there too
       // challengers + whole-paper challenger run claimless
       j({ validated: [], new_comments: [] }),
       j({ validated: [], new_comments: [] }),
       j({ validated: [], new_comments: [] }),
-      'also {{{ not json', // meta: garbage -> meta failed (no repair: meta uses callJson)
+      'also {{{ not json', // meta: garbage...
+      'still {{{ not json', // ...repair replay: garbage -> meta failed
       j({ validated: [], rejected: [] }), // validator — never reached (no candidates)
     );
     const small = new ScriptedProvider();
     small.queue(
-      'survey {{{ nope', // surveyor (SMALL): garbage -> survey failed
+      'survey {{{ nope', // surveyor (SMALL): garbage...
+      'still {{{ garbage', // ...repair replay: garbage -> survey failed
+      j({ items: [] }), // copyedit annex (runs regardless; never blocks)
     );
     const settings = makeSettings();
     const { state, events } = await drain(
@@ -546,11 +571,13 @@ describe('runReview malformed JSON', () => {
       j({ validated: [], new_comments: [] }),
       j({ validated: [], new_comments: [] }),
       j({ overall_feedback: 'ok' }),
+      j({ overall_feedback: '## synth' }), // synthesis (7f)
       // validator never runs: no candidates survived
     );
     const small = new ScriptedProvider();
     small.queue(
       j({ selected: [], state_of_the_art_notes: '', missing_references: [] }),
+      j({ items: [] }), // copyedit annex
     );
     const { state } = await drain(
       runReview({
@@ -611,8 +638,8 @@ describe('runReview crash recovery', () => {
 describe('runReview depth preset wiring', () => {
   it('perSectionLenses=false runs claims+challengers only; true runs the lens matrix on small', async () => {
     // lenses off: triage + inventory (empty -> claims failed, no repair consumed)
-    // + survey + 2 challengers + whole-paper challenger + meta = 7 strong calls
-    // (validator skipped: no candidates survive a claimless run)
+    // + survey + 2 challengers + whole-paper challenger + meta + synthesis =
+    // 7 strong calls (validator skipped: no candidates survive a claimless run)
     const strong = new ScriptedProvider();
     strong.queue(
       j({ summary: 's' }),
@@ -622,10 +649,12 @@ describe('runReview depth preset wiring', () => {
       j({ validated: [], new_comments: [] }),
       j({ validated: [], new_comments: [] }),
       j({ overall_feedback: 'ok' }),
+      j({ overall_feedback: '## synth' }), // synthesis (7f)
     );
     const small0 = new ScriptedProvider();
     small0.queue(
       j({ selected: [], state_of_the_art_notes: '', missing_references: [] }),
+      j({ items: [] }), // copyedit annex
     );
     await drain(
       runReview({
@@ -635,12 +664,14 @@ describe('runReview depth preset wiring', () => {
       }),
     );
     // triage + inventory + 2 section challengers + whole-paper challenger +
-    // meta = 6 (survey moved to small; validator skipped, no candidates)
-    expect(strong.calls).toHaveLength(6);
+    // meta + synthesis = 7 (survey moved to small; validator skipped,
+    // no candidates)
+    expect(strong.calls).toHaveLength(7);
 
     // lenses on, whole-paper off: statistical_content 'regression' ->
-    // prose + empirical + lit = 3 lenses x 2 sections = 6 SMALL calls
-    // (the surveyor makes it 7 on small overall)
+    // prose + empirical + stats + lit + clarity = 5 lenses x 2 sections =
+    // 10 SMALL calls (7f added the stats lens for empirical triage and made
+    // clarity always-on; the surveyor makes it 11 on small overall)
     const strong2 = new ScriptedProvider();
     strong2.queue(
       j({ summary: 's', statistical_content: 'regression' }),
@@ -650,12 +681,14 @@ describe('runReview depth preset wiring', () => {
       j({ validated: [], new_comments: [] }),
       j({ validated: [], new_comments: [] }), // whole-paper challenger (always runs)
       j({ overall_feedback: 'ok' }),
+      j({ overall_feedback: '## synth' }), // synthesis (7f)
     );
     const small2 = new ScriptedProvider();
     small2.queue(
       j({ selected: [], state_of_the_art_notes: '', missing_references: [] }),
     );
-    for (let i = 0; i < 6; i++) small2.queue(j({ comments: [] }));
+    for (let i = 0; i < 10; i++) small2.queue(j({ comments: [] }));
+    small2.queue(j({ items: [] })); // copyedit annex
     await drain(
       runReview({
         doc: makeDoc(),
@@ -665,10 +698,10 @@ describe('runReview depth preset wiring', () => {
         providers: { strong: strong2, small: small2 },
       }),
     );
-    expect(small2.calls).toHaveLength(7);
+    expect(small2.calls).toHaveLength(12);
     // lens order: lens-outer loop -> 2 sections per lens: prose, prose,
-    // empirical, empirical, lit, lit; calls[0] is the surveyor (survey
-    // stage precedes verify).
+    // empirical, empirical, stats, stats, lit, lit, clarity, clarity;
+    // calls[0] is the surveyor (survey stage precedes verify).
     expect(small2.calls[1]!.messages[0]!.content).toContain(
       'INTERNAL COHERENCE REFEREE',
     );
@@ -676,7 +709,560 @@ describe('runReview depth preset wiring', () => {
       'STATISTICS AND ECONOMETRICS REFEREE',
     );
     expect(small2.calls[5]!.messages[0]!.content).toContain(
+      'STATISTICAL RIGOR REFEREE',
+    );
+    expect(small2.calls[7]!.messages[0]!.content).toContain(
       'LITERATURE COHERENCE REFEREE',
     );
+    expect(small2.calls[9]!.messages[0]!.content).toContain('CLARITY REFEREE');
+  });
+});
+
+describe('deterministic checkers (7b)', () => {
+  // A manuscript with real structure: duplicate Figure 1 captions, a dangling
+  // Figure 9 reference, and a section reference to a missing section — the
+  // xref check must find them and the findings must reach the REPORT as
+  // provenance-'deterministic' comments (Python _assemble parity). The
+  // abstract/body carry a number conflict for the consistency check.
+  const CHECKER_MD = `# Checker Paper
+
+## Abstract
+
+Our mean absolute error is 3.42 across all benchmarks in this study.
+
+## 1. Intro
+
+Figure 1: the pipeline. See Section 4 for the ablations. Figure 9 plots the
+rest. The reported mean absolute error is 4.10 in the harder split.
+
+## References
+
+[1] Smith, J. (2001). A paper. Journal of Papers.
+`;
+
+  function checkerDoc(): Document {
+    return readMarkdown(CHECKER_MD);
+  }
+
+  it('findings reach the report as deterministic comments in their own section', async () => {
+    const strong = new ScriptedProvider();
+    strong.queue(
+      j({ summary: 's' }),
+      j({ claims: [] }), // claimless: verify = checkers only
+      j({ validated: [], new_comments: [] }),
+      j({ validated: [], new_comments: [] }),
+      j({ validated: [], new_comments: [] }),
+      j({ overall_feedback: 'ok' }),
+      j({ overall_feedback: '## synth' }), // synthesis (7f)
+      // e2ba304 (7R F1): checker findings are assemble-only — they never
+      // enter the meta merge or the validate stream, so validate has no LLM
+      // candidates here (challengeValidated is empty) and SKIPS entirely.
+      // No validator reply is queued.
+    );
+    const small = new ScriptedProvider();
+    small.queue(
+      j({ selected: [], state_of_the_art_notes: '', missing_references: [] }),
+      j({
+        entries: [{ raw_entry: '[1] Smith, J. (2001)', status: 'verified' }],
+        in_text_issues: [],
+        missing_key_references: [],
+      }),
+      j({ items: [] }),
+    );
+    const { state, events } = await drain(
+      runReview({
+        doc: checkerDoc(),
+        settings: makeSettings(),
+        providers: { strong, small },
+      }),
+    );
+
+    // the verify head emitted the sorted-kinds detail (Python format):
+    // sorted kinds joined by ', ' — consistency before xref alphabetically
+    const detEvent = events.find(
+      (e) => e.stage === 'verify' && e.detail?.startsWith('deterministic checks: '),
+    );
+    expect(detEvent).toBeDefined();
+    expect(detEvent!.detail).toBe('deterministic checks: consistency×1, xref×2');
+
+    // findings persisted on the run state
+    const findings = state.checkerFindings as Record<string, unknown>[];
+    expect(findings.length).toBeGreaterThan(0);
+    expect(findings.every((f) => f['provenance'] === 'deterministic')).toBe(true);
+    expect(findings.some((f) => f['check'] === 'xref')).toBe(true);
+
+    // findings JOIN the report (Python _assemble: checkerComments first) and
+    // are anchored like every other comment (ids over the combined list).
+    const report = state.report as import('../src/report/models').ReviewReport;
+    const detComments = report.comments.filter((c) => c.provenance === 'deterministic');
+    expect(detComments.length).toBe(findings.length);
+    // markdown ingest has no figure artifacts pre-extraction wiring: the xref
+    // check sees only the prose-embedded "Figure 1: the pipeline."
+    // definition -> Figure 9 dangles, Section 4 is unregistered
+    expect(detComments.some((c) => c.title === 'Reference to undefined Figure 9')).toBe(
+      true,
+    );
+    expect(
+      detComments.some(
+        (c) => c.title === 'References to sections without matching headings',
+      ),
+    ).toBe(true);
+    // section stamped from the resolved block's section path
+    const fig9 = detComments.find(
+      (c) => c.title === 'Reference to undefined Figure 9',
+    )!;
+    expect(fig9.section).toBe('1. Intro');
+    // ids number the COMBINED list (checker comments come first: c000...)
+    expect(report.comments[0]!.provenance).toBe('deterministic');
+    expect(report.comments[0]!.id).toBe('c000');
+
+    // e2ba304 (7R F1) meta pin: the checker findings do NOT enter the META
+    // prompt anymore (assemble-only) — the meta stream carries only the
+    // (empty) challenge-validated merge, and validate never runs (no LLM
+    // candidates without checker findings in the stream).
+    const metaCall = strong.calls.find((c) =>
+      c.messages[1]!.content.startsWith('Manuscript title: Checker Paper\n\nTriage:'),
+    )!;
+    expect(metaCall.messages[1]!.content).not.toContain(
+      'Reference to undefined Figure 9',
+    );
+    const validateCall = strong.calls.find((c) =>
+      c.messages[0]!.content.includes('REVIEW VALIDATOR'),
+    );
+    expect(validateCall).toBeUndefined();
+    // assemble prepends each checker title EXACTLY ONCE with deterministic
+    // provenance (no meta dedupe pass touched them).
+    const titles = report.comments.map((c) => c.title);
+    expect(titles.filter((t) => t === 'Reference to undefined Figure 9')).toHaveLength(
+      1,
+    );
+    const synthCall = strong.calls.find((c) =>
+      c.messages[0]!.content.includes('LEAD REFEREE'),
+    )!;
+    expect(synthCall.messages[1]!.content).toContain(
+      'Validated comments (title | severity | provenance | anchor):',
+    );
+  });
+
+  it('resume with checkerFindings present: the scan is skipped (emit absent)', async () => {
+    // Run once to completion, then resume the finished run: verify is
+    // done-with-artifact so the stage is skipped entirely — but the DOI
+    // findings coupling needs a different path: simulate a run where the
+    // state carries checker findings but verify re-enters (failed verify).
+    const strong = new ScriptedProvider();
+    strong.queue(
+      j({ summary: 's' }),
+      j({ claims: [] }),
+      j({ validated: [], new_comments: [] }),
+      j({ validated: [], new_comments: [] }),
+      j({ validated: [], new_comments: [] }),
+      j({ overall_feedback: 'first pass' }),
+      j({ overall_feedback: '## synth' }), // synthesis (7f)
+      // validate (7f merged stream: 4 checker findings, 0 LLM candidates)
+      j({ rejected: [], comments: [] }),
+    );
+    const small = new ScriptedProvider();
+    small.queue(
+      j({ selected: [], state_of_the_art_notes: '', missing_references: [] }),
+      j({
+        entries: [{ raw_entry: '[1] Smith, J. (2001)', status: 'verified' }],
+        in_text_issues: [],
+        missing_key_references: [],
+      }),
+      j({ items: [] }),
+    );
+    const first = await drain(
+      runReview({
+        doc: checkerDoc(),
+        settings: makeSettings(),
+        providers: { strong, small },
+      }),
+    );
+    const resumeState = await loadRun(first.state.runId);
+    const findingsBefore = (resumeState!.checkerFindings ?? []).length;
+    expect(findingsBefore).toBeGreaterThan(0);
+
+    // Resume the completed run. Every stage re-enters done-with-artifact
+    // except claims (failed: empty inventory) — verify itself is done with
+    // candidates, so the deterministic scan MUST NOT re-run and NO second
+    // 'deterministic checks:' event may appear.
+    const strong2 = new ScriptedProvider();
+    strong2.queue(j({ claims: [] })); // claims re-run only
+    const small2 = new ScriptedProvider();
+    const second = await drain(
+      runReview({
+        doc: checkerDoc(),
+        settings: makeSettings(),
+        providers: { strong: strong2, small: small2 },
+        resume: { state: resumeState! },
+      }),
+    );
+    const detEvents = second.events.filter(
+      (e) => e.stage === 'verify' && e.detail?.startsWith('deterministic checks: '),
+    );
+    expect(detEvents).toHaveLength(0);
+    // findings preserved exactly (no double-append)
+    expect((second.state.checkerFindings ?? []).length).toBe(findingsBefore);
+    // report still assembled; deterministic comments re-derive from the
+    // preserved findings via checkerComments at assemble time
+    const report = second.state.report as import('../src/report/models').ReviewReport;
+    const detComments = report.comments.filter((c) => c.provenance === 'deterministic');
+    // 4 findings: Figure 9 dangling + section-refs + number conflict + one
+    // DOI resolution (bibliography unmatched entry '[2] Doe, J. (2010).' —
+    // the REFERENCES fixture entry fails to match offline -> doi finding)
+    expect(detComments.map((c) => c.title)).toEqual([
+      'Reference to undefined Figure 9',
+      'References to sections without matching headings',
+      'Conflicting values for "absolute error is" (3.42 vs 4.10)',
+      'Reference not resolvable in Crossref/OpenAlex',
+    ]);
+  });
+
+  it('coupling: pre-seeded doi findings make verify skip the deterministic scan', async () => {
+    // Python gate is `if not self.state.checker_findings` — any existing
+    // findings (e.g. doi-resolution from a resumed bibliography) suppress
+    // the scan. Simulate by injecting findings into the resume state.
+    const strong = new ScriptedProvider();
+    strong.queue(
+      j({ summary: 's' }),
+      j({ claims: [] }),
+      j({ validated: [], new_comments: [] }),
+      j({ validated: [], new_comments: [] }),
+      j({ validated: [], new_comments: [] }),
+      j({ overall_feedback: 'ok' }),
+      j({ overall_feedback: '## synth' }), // synthesis (7f)
+      j({ rejected: [], comments: [] }), // validate over the merged stream
+    );
+    const small = new ScriptedProvider();
+    small.queue(
+      j({ selected: [], state_of_the_art_notes: '', missing_references: [] }),
+      j({
+        entries: [{ raw_entry: '[1] Smith, J. (2001)', status: 'verified' }],
+        in_text_issues: [],
+        missing_key_references: [],
+      }),
+      j({ items: [] }),
+    );
+    const resumeState = await loadRun(
+      (
+        await drain(
+          runReview({
+            doc: checkerDoc(),
+            settings: makeSettings(),
+            providers: { strong, small },
+          }),
+        )
+      ).state.runId,
+    );
+    // wipe + re-seed findings the way the bibliography doi-resolution would
+    resumeState!.checkerFindings = [
+      {
+        check: 'doi-resolution',
+        title: 'Reference not resolvable in Crossref/OpenAlex',
+        message: 'phantom',
+        quote: '[1] Smith',
+        category: 'reference',
+        severity: 0.4,
+        meta: { kind: 'unmatched', score: 0 },
+        provenance: 'deterministic',
+      },
+    ];
+    const strong2 = new ScriptedProvider();
+    strong2.queue(
+      j({ claims: [] }), // claims re-run
+      // verify re-enters too (simulate by wiping candidates + verify status)
+    );
+    const small2 = new ScriptedProvider();
+    resumeState!.stages['verify'] = 'pending';
+    resumeState!.artifacts!.candidates = [];
+    const { events, state } = await drain(
+      runReview({
+        doc: checkerDoc(),
+        settings: makeSettings(),
+        providers: { strong: strong2, small: small2 },
+        resume: { state: resumeState! },
+      }),
+    );
+    // the scan is SKIPPED: no new deterministic-checks emit, and the seeded
+    // doi finding is still the ONLY checker finding
+    expect(
+      events.filter(
+        (e) => e.stage === 'verify' && e.detail?.startsWith('deterministic checks: '),
+      ),
+    ).toHaveLength(0);
+    expect((state.checkerFindings ?? []).length).toBe(1);
+    expect((state.checkerFindings ?? [])[0]!['check']).toBe('doi-resolution');
+    // and the doi finding still reaches the report as a comment
+    const report = state.report as import('../src/report/models').ReviewReport;
+    const detComments = report.comments.filter((c) => c.provenance === 'deterministic');
+    expect(detComments.map((c) => c.comment)).toEqual(['phantom']);
+  });
+
+  // e2ba304 (7R F1): origin/main test_yield.py ports — the checker findings
+  // are ASSEMBLE-ONLY (meta must not dissolve them, assemble prepends them
+  // fresh with provenance intact).
+  it('port: meta does not dissolve checker comments (test_meta_does_not_dissolve_checker_comments)', async () => {
+    const strong = new ScriptedProvider();
+    strong.queue(
+      j({ summary: 's' }),
+      j({ claims: [] }),
+      j({ validated: [], new_comments: [] }),
+      j({ validated: [], new_comments: [] }),
+      j({ validated: [], new_comments: [] }),
+      j({ overall_feedback: 'ok' }),
+      j({ overall_feedback: '## synth' }),
+    );
+    const small = new ScriptedProvider();
+    small.queue(
+      j({ selected: [], state_of_the_art_notes: '', missing_references: [] }),
+      j({
+        entries: [{ raw_entry: '[1] Smith, J. (2001)', status: 'verified' }],
+        in_text_issues: [],
+        missing_key_references: [],
+      }),
+      j({ items: [] }),
+    );
+    const { state } = await drain(
+      runReview({
+        doc: checkerDoc(),
+        settings: makeSettings(),
+        providers: { strong, small },
+      }),
+    );
+    const metaCall = strong.calls.find((c) =>
+      c.messages[1]!.content.startsWith('Manuscript title: Checker Paper\n\nTriage:'),
+    )!;
+    const metaUser = metaCall.messages[1]!.content;
+    // NO checker finding title, quote, or provenance tag rides the meta
+    // prompt: the merge is list(validated) ONLY.
+    expect(metaUser).not.toContain('Reference to undefined Figure 9');
+    expect(metaUser).not.toContain('References to sections without matching headings');
+    expect(metaUser).not.toContain('"provenance": "deterministic"');
+    // and meta's OUTPUT cannot have dissolved anything — every finding
+    // survives to the report verbatim, exactly once.
+    const report = state.report as import('../src/report/models').ReviewReport;
+    const titles = report.comments.map((c) => c.title);
+    for (const t of [
+      'Reference to undefined Figure 9',
+      'References to sections without matching headings',
+      'Conflicting values for "absolute error is" (3.42 vs 4.10)',
+    ]) {
+      expect(titles.filter((x) => x === t)).toHaveLength(1);
+    }
+  });
+
+  it('port: assemble prepends checker comments with provenance (test_assemble_appends_checker_comments_with_provenance)', async () => {
+    const strong = new ScriptedProvider();
+    strong.queue(
+      j({ summary: 's' }),
+      // one logical claim so the claim worker (wholePaperPasses=false: no
+      // whole-paper verifier) produces the LLM candidate — the ASSEMBLE order
+      // is then observable: the LLM comment must come AFTER the
+      // deterministic block (Python finalComments = checker + draft.comments).
+      j({
+        claims: [
+          {
+            id: 'cl001',
+            type: 'logical',
+            importance: 'central',
+            components: { statement: 's' },
+            anchor: 'See Section 4 for the ablations',
+            section: '1. Intro',
+          },
+        ],
+      }),
+      // claim worker (logical -> strong)
+      j({
+        comments: [
+          {
+            quote: 'See Section 4 for the ablations',
+            message: 'Section 4 is referenced but absent',
+            score: 0.5,
+          },
+        ],
+      }),
+      // Front-matter challenger keeps the claim (no drops); the whole-paper
+      // challenger then validates it through — the candidate must SURVIVE
+      // challenge for the assemble order to be observable.
+      j({ validated: [], new_comments: [] }),
+      j({
+        validated: [
+          {
+            paragraph_anchor: 'See Section 4 for the ablations',
+            quote: 'See Section 4 for the ablations',
+            message: 'Section 4 is referenced but absent',
+            score: 0.5,
+          },
+        ],
+        new_comments: [],
+      }),
+      j({ overall_feedback: 'ok' }),
+      j({ overall_feedback: '## synth' }),
+      // validator: challengeValidated is non-empty now (the whole-paper
+      // challenger kept the claim worker's candidate) — it keeps everything.
+      j({ validated: [0], rejected: [] }),
+    );
+    const small = new ScriptedProvider();
+    small.queue(
+      j({ selected: [], state_of_the_art_notes: '', missing_references: [] }),
+      j({
+        entries: [{ raw_entry: '[1] Smith, J. (2001)', status: 'verified' }],
+        in_text_issues: [],
+        missing_key_references: [],
+      }),
+      j({ items: [] }),
+    );
+    const { state } = await drain(
+      runReview({
+        doc: checkerDoc(),
+        settings: makeSettings(),
+        providers: { strong, small },
+      }),
+    );
+    const report = state.report as import('../src/report/models').ReviewReport;
+    // deterministic block FIRST, LLM comments after (assemble prepend)
+    const firstLlm = report.comments.findIndex((c) => c.provenance !== 'deterministic');
+    expect(firstLlm).toBeGreaterThan(0);
+    expect(
+      report.comments.slice(0, firstLlm).every((c) => c.provenance === 'deterministic'),
+    ).toBe(true);
+    // every deterministic comment keeps quote + provenance (upstream pins)
+    for (const c of report.comments.filter((x) => x.provenance === 'deterministic')) {
+      expect(c.quote).not.toBe('');
+      expect(c.title).not.toBe('');
+    }
+    // ids number the COMBINED list in order (c000.. deterministic, then LLM)
+    expect(report.comments[0]!.id).toBe('c000');
+    expect(report.comments[firstLlm]!.id).toBe(`c${String(firstLlm).padStart(3, '0')}`);
+  });
+});
+
+describe('runReview malformed-envelope tolerance (fe463f2 + 61f5822)', () => {
+  it('whole-paper challenger returning a bare validated list still yields comments', async () => {
+    const anchor = 'We prove the main theorem in this paper';
+    const strong = new ScriptedProvider();
+    strong.queue(
+      j({ summary: 's' }),
+      j({
+        claims: [
+          {
+            id: 'cl001',
+            type: 'logical',
+            importance: 'central',
+            components: { statement: 's' },
+            anchor,
+            section: 'Introduction',
+          },
+        ],
+      }),
+      // claim worker (logical -> strong): one candidate
+      j({ comments: [{ quote: anchor, message: 'bare list candidate', score: 0.6 }] }),
+      // Intro challenger: normal envelope, drops nothing new
+      j({ validated: [], new_comments: [] }),
+      // Methods challenger
+      j({ validated: [], new_comments: [] }),
+      // whole-paper challenger: BARE LIST (fe463f2), with a non-dict item (61f5822)
+      j([
+        {
+          paragraph_anchor: anchor,
+          quote: anchor,
+          message: 'kept from bare list',
+          score: 0.7,
+        },
+        'a bare string item',
+        42,
+      ]),
+      j({ overall_feedback: 'ok' }),
+      j({ overall_feedback: '## synth' }), // synthesis (7f)
+      // validator keeps everything
+      j({ validated: [0], rejected: [] }),
+    );
+    const small = new ScriptedProvider();
+    small.queue(
+      j({ selected: [], state_of_the_art_notes: '', missing_references: [] }),
+      j({ items: [] }),
+    );
+    const { state } = await drain(
+      runReview({
+        doc: makeDoc(),
+        settings: makeSettings(),
+        providers: { strong, small },
+      }),
+    );
+    expect(state.stages['challenge']).toBe('done');
+    const report = state.report as import('../src/report/models').ReviewReport;
+    const msgs = report.comments.map((c) => c.comment);
+    expect(msgs).toContain('kept from bare list');
+    // the non-dict items never became comments
+    expect(msgs).not.toContain('a bare string item');
+  });
+
+  it('section challenger non-dict validated/new_comments items are skipped', async () => {
+    const anchor = 'We prove the main theorem in this paper';
+    const strong = new ScriptedProvider();
+    strong.queue(
+      j({ summary: 's' }),
+      j({
+        claims: [
+          {
+            id: 'cl001',
+            type: 'logical',
+            importance: 'central',
+            components: { statement: 's' },
+            anchor,
+            section: 'Introduction',
+          },
+        ],
+      }),
+      j({}),
+      j({ comments: [{ quote: anchor, message: 'survivor', score: 0.6 }] }),
+      // Intro challenger: validated carries non-dict junk; new_comments too
+      j({
+        validated: [
+          'garbage string',
+          7,
+          {
+            paragraph_anchor: anchor,
+            quote: anchor,
+            message: 'real one',
+            score: 0.8,
+            verdict: 'kept',
+          },
+        ],
+        new_comments: [
+          'junk',
+          {
+            paragraph_anchor: anchor,
+            quote: anchor,
+            message: 'fresh find',
+            score: 0.5,
+          },
+        ],
+      }),
+      j({ validated: [], new_comments: [] }),
+      j({ validated: [], new_comments: [] }),
+      j({ overall_feedback: 'ok' }),
+      j({ overall_feedback: '## synth' }), // synthesis (7f)
+      j({ validated: [0], rejected: [] }),
+    );
+    const small = new ScriptedProvider();
+    small.queue(
+      j({ selected: [], state_of_the_art_notes: '', missing_references: [] }),
+      j({ items: [] }),
+    );
+    const { state } = await drain(
+      runReview({
+        doc: makeDoc(),
+        settings: makeSettings(),
+        providers: { strong, small },
+      }),
+    );
+    expect(state.stages['challenge']).toBe('done');
+    const report = state.report as import('../src/report/models').ReviewReport;
+    const msgs = report.comments.map((c) => c.comment);
+    expect(msgs).toContain('real one');
+    expect(msgs).toContain('fresh find');
+    expect(msgs).not.toContain('garbage string');
+    expect(msgs).not.toContain('junk');
   });
 });

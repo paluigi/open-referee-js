@@ -10,6 +10,41 @@ import { LLMError } from './base';
 
 export const RETRY_BASE_DELAY_MS = 500;
 
+/**
+ * Retry-event sink (Python 814c895: logger.warning per retry with model,
+ * attempt, error and backoff). The browser build has no logging framework:
+ * the hook is collectible — the UI/tests install a sink, silence is the
+ * default. Never console.log (the app's own rule).
+ */
+export interface RetryLogEvent {
+  /** provider/model making the call */
+  model: string;
+  /** 1-based failing attempt number */
+  attempt: number;
+  /** error type + truncated message */
+  error: string;
+  /** backoff before the next attempt, ms */
+  backoffMs: number;
+}
+
+type RetrySink = (e: RetryLogEvent) => void;
+
+let retrySink: RetrySink | undefined;
+
+/** Install (or remove with undefined) the retry-log sink. */
+export function setRetryLogger(sink: RetrySink | undefined): void {
+  retrySink = sink;
+}
+
+/** Internal: emit one retry event (no-op without a sink). */
+export function logRetry(event: RetryLogEvent): void {
+  try {
+    retrySink?.(event);
+  } catch {
+    // a broken sink must never break the retry loop
+  }
+}
+
 export function defaultSleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -35,6 +70,8 @@ export interface RetryFetchArgs {
   /** Per-attempt timeout in ms; undefined = no timeout. */
   timeoutMs: number | undefined;
   sleep: (ms: number) => Promise<void>;
+  /** Provider/model label for retry-log events (Python spec.provider_name/spec.model). */
+  label?: string;
 }
 
 /**
@@ -42,7 +79,7 @@ export interface RetryFetchArgs {
  * Response, or throws LLMError (with .status for non-retryable statuses).
  */
 export async function retryFetch(args: RetryFetchArgs): Promise<Response> {
-  const { fetchImpl, url, init, maxRetries, timeoutMs, sleep } = args;
+  const { fetchImpl, url, init, maxRetries, timeoutMs, sleep, label } = args;
   let lastError: LLMError | undefined;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     // Per-attempt timeout: a hung endpoint aborts like a network error and
@@ -60,7 +97,14 @@ export async function retryFetch(args: RetryFetchArgs): Promise<Response> {
         `network error: ${err instanceof Error ? err.message : String(err)}`,
       );
       if (attempt < maxRetries) {
-        await sleep(RETRY_BASE_DELAY_MS * 2 ** attempt);
+        const backoffMs = RETRY_BASE_DELAY_MS * 2 ** attempt;
+        logRetry({
+          model: label ?? url,
+          attempt: attempt + 1,
+          error: `LLMError: ${lastError.message.slice(0, 120)}`,
+          backoffMs,
+        });
+        await sleep(backoffMs);
         continue;
       }
       throw lastError;
@@ -75,7 +119,14 @@ export async function retryFetch(args: RetryFetchArgs): Promise<Response> {
       );
       if (attempt < maxRetries) {
         const raMs = retryAfterMs(res);
-        await sleep(raMs ?? RETRY_BASE_DELAY_MS * 2 ** attempt);
+        const backoffMs = raMs ?? RETRY_BASE_DELAY_MS * 2 ** attempt;
+        logRetry({
+          model: label ?? url,
+          attempt: attempt + 1,
+          error: `LLMError: ${lastError.message.slice(0, 120)}`,
+          backoffMs,
+        });
+        await sleep(backoffMs);
         continue;
       }
       throw lastError;

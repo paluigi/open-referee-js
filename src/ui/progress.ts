@@ -17,6 +17,7 @@ const STAGE_LABELS: Record<Stage, string> = {
   bibliography: 'Citation audit',
   meta: 'Meta-review',
   validate: 'Validate comments',
+  copyedit: 'Language fixes',
   assemble: 'Assemble report',
 };
 
@@ -30,6 +31,7 @@ const STAGE_ORDER: Stage[] = [
   'bibliography',
   'meta',
   'validate',
+  'copyedit',
   'assemble',
 ];
 
@@ -37,6 +39,7 @@ export class ProgressController {
   readonly root: HTMLElement;
   private readonly bar: HTMLProgressElement;
   private readonly label: HTMLElement;
+  private readonly spend: HTMLElement;
   private readonly items: Map<Stage, HTMLElement>;
 
   constructor(root: HTMLElement) {
@@ -46,6 +49,10 @@ export class ProgressController {
     this.bar.value = 0;
     this.label = document.createElement('p');
     this.label.className = 'progress-label';
+    // Spend-so-far line (Stage 7c budget core); hidden until a run books spend.
+    this.spend = document.createElement('p');
+    this.spend.className = 'progress-spend';
+    this.spend.hidden = true;
     const list = document.createElement('ul');
     list.className = 'stage-list';
     this.items = new Map();
@@ -57,7 +64,7 @@ export class ProgressController {
       list.appendChild(li);
       this.items.set(stage, li);
     }
-    root.replaceChildren(this.bar, this.label, list);
+    root.replaceChildren(this.bar, this.label, this.spend, list);
   }
 
   /** Feed one orchestrator event (with optional per-section progress). */
@@ -97,6 +104,19 @@ export class ProgressController {
   setStageStatus(stage: Stage, status: StageEvent['status']): void {
     const li = this.items.get(stage);
     if (li) li.dataset.status = status;
+  }
+
+  /**
+   * Show the spend-so-far line (Stage 7c). Empty string hides the line.
+   */
+  setSpend(line: string): void {
+    if (line === '') {
+      this.spend.hidden = true;
+      this.spend.textContent = '';
+    } else {
+      this.spend.hidden = false;
+      this.spend.textContent = line;
+    }
   }
 
   /** Mark everything not yet finished as skipped (e.g. after an early exit). */

@@ -11,6 +11,8 @@
 
 import { loadSettings, saveSettings } from '../config/storage';
 import type { AppSettings, ProviderType } from '../config/schema';
+import type { PricingEntry } from '../providers/usage';
+import { BudgetHarness, documentStatsFromDoc } from '../pipeline/budget';
 import {
   deleteSecret,
   getSecret,
@@ -21,9 +23,16 @@ import {
 } from '../config/secrets';
 import type { Document } from '../ingestion/document';
 import { ingestByExtensionAsync } from '../ingestion/readers_md';
-import { createProvider, closeProviders } from '../providers/factory';
+import {
+  createProvider,
+  closeProviders,
+  createDecisionProvider,
+} from '../providers/factory';
 import { RateLimiter } from '../providers/rate_limit';
 import type { ChatProvider } from '../providers/base';
+import type { DecisionCaller } from '../pipeline/orchestrator';
+import type { DecisionQuestion } from '../providers/decisions';
+import { DecisionsClient } from '../providers/decisions';
 import { runReview } from '../pipeline/orchestrator';
 import { loadRun, listRuns } from '../runs/store';
 import type { RunState } from '../pipeline/state';
@@ -44,6 +53,7 @@ const PROVIDER_TYPES: ProviderType[] = [
   'gemini',
   'ollama',
   'vllm',
+  'decision',
 ];
 const ROLES = ['strong', 'small', 'vision'] as const;
 
@@ -75,6 +85,34 @@ async function resolveKey(providerName: string): Promise<string> {
     if (fromVault !== undefined) return fromVault;
   }
   return sessionKeys.get(providerName) ?? '';
+}
+
+/**
+ * 7e review (B6): build the decision-model caller from the bound decision
+ * role — Python RolePool wires `pool.decider` from
+ * `build_decision_provider(...)` so the DM layer is reachable from the UI.
+ * Returns undefined when the role is unbound/incomplete (dormant DM layer).
+ */
+async function buildDecider(
+  settings: AppSettings,
+): Promise<DecisionCaller | undefined> {
+  const dr = settings.decisionRole;
+  if (!dr?.provider || !dr.model) return undefined;
+  const cfg = settings.providers[dr.provider];
+  if (!cfg || cfg.type !== 'decision' || !cfg.baseUrl) return undefined;
+  const apiKey = await resolveKey(dr.provider);
+  const rateLimiter = new RateLimiter(settings.minDelayS);
+  const client: DecisionsClient = createDecisionProvider({
+    baseUrl: cfg.baseUrl,
+    apiKey: apiKey || undefined,
+    rateLimiter,
+    requestTimeoutS: settings.requestTimeoutS,
+    maxRetries: settings.maxRetries,
+  });
+  return async (input, questions: readonly DecisionQuestion[], _callType) => {
+    void _callType;
+    return client.decide(input, questions);
+  };
 }
 
 // ----------------------------------------------------------------- settings --
@@ -259,6 +297,12 @@ function settingsPanel(settings: AppSettings, onChange: () => void): SettingsUiH
           bindingsChanged = true;
         }
       }
+      // Stage 7e: a removed decision-provider binding drops the role entirely
+      // (an unbound decision role is the documented dormant state).
+      if (settings.decisionRole?.provider === name) {
+        settings.decisionRole = undefined;
+        bindingsChanged = true;
+      }
       saveSettings(settings);
       row.remove();
       rebuildRoleSelects();
@@ -414,7 +458,217 @@ function settingsPanel(settings: AppSettings, onChange: () => void): SettingsUiH
     );
   }
 
+  // ---- decision role (Stage 7e) ----
+  // Optional binding to a provider of type 'decision' (/v1/decisions API).
+  // Unbound (default) = the DM layer is dormant and every stage uses its
+  // labelled-LLM fallback with byte-identical call sequences.
+  {
+    const dr = settings.decisionRole ?? { provider: '', model: '' };
+    const decSel = el('select', {
+      id: 'role-provider-decision',
+      'aria-label': 'provider for decision role',
+    });
+    const emptyOpt = document.createElement('option');
+    emptyOpt.value = '';
+    emptyOpt.textContent = '— none (decision models disabled) —';
+    decSel.appendChild(emptyOpt);
+    for (const name of Object.keys(settings.providers)) {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      if (dr.provider === name) opt.selected = true;
+      decSel.appendChild(opt);
+    }
+    decSel.addEventListener('change', () => {
+      const v = decSel.value;
+      if (!v && !settings.decisionRole?.model) {
+        delete settings.decisionRole;
+      } else {
+        settings.decisionRole = {
+          ...(settings.decisionRole ?? { model: '' }),
+          provider: v,
+        };
+      }
+      saveSettings(settings);
+      onChange();
+    });
+    const decModel = el('input', {
+      type: 'text',
+      id: 'decision-model',
+      placeholder: 'decision model name',
+      value: dr.model,
+      'aria-label': 'model for decision role',
+    });
+    decModel.addEventListener('change', () => {
+      const v = decModel.value.trim();
+      if (!v && !settings.decisionRole?.provider) {
+        delete settings.decisionRole;
+      } else {
+        settings.decisionRole = {
+          ...(settings.decisionRole ?? { provider: '' }),
+          model: v,
+        };
+      }
+      saveSettings(settings);
+      onChange();
+    });
+    fieldset.appendChild(
+      el(
+        'div',
+        { class: 'row' },
+        el('label', {}, 'decision role (optional)', decSel, decModel),
+      ),
+    );
+  }
+
+  // ---- budget tier (Stage 7c) ----
+  // fast / standard / deep presets (Python USD figures verbatim) + auto
+  // (budget-driven planner). budgetUsd is the hard plan ceiling.
+  const TIER_LABELS: Record<string, string> = {
+    fast: 'Fast — cheap but substantive (est. ~$1-3)',
+    standard: 'Standard — hosted deep-review class (est. ~$3-8)',
+    deep: 'Deep — beyond deep-review (est. ~$10-25)',
+    auto: 'Auto — budget-driven planner (uses the cap below)',
+  };
+  const tierSel = el('select', {
+    id: 'budget-tier',
+    'aria-label': 'budget tier',
+  });
+  for (const tier of ['fast', 'standard', 'deep', 'auto']) {
+    const opt = document.createElement('option');
+    opt.value = tier;
+    opt.textContent = TIER_LABELS[tier]!;
+    if ((settings.budget?.depth ?? 'standard') === tier) opt.selected = true;
+    tierSel.appendChild(opt);
+  }
+  tierSel.addEventListener('change', () => {
+    settings.budget = { ...(settings.budget ?? {}), depth: tierSel.value };
+    saveSettings(settings);
+    onChange();
+  });
+  const budgetCap = el('input', {
+    type: 'number',
+    id: 'budget-cap',
+    min: '0',
+    step: '0.5',
+    placeholder: 'hard budget cap (USD)',
+    value:
+      settings.budget?.budgetUsd !== undefined ? String(settings.budget.budgetUsd) : '',
+    'aria-label': 'hard budget cap in USD',
+  });
+  budgetCap.addEventListener('change', () => {
+    const v = Number(budgetCap.value);
+    settings.budget = {
+      ...(settings.budget ?? {}),
+      budgetUsd: Number.isFinite(v) && budgetCap.value !== '' ? v : undefined,
+    };
+    saveSettings(settings);
+    onChange();
+  });
+  fieldset.appendChild(el('h2', {}, 'Budget'));
+  fieldset.appendChild(
+    el('div', { class: 'row' }, el('label', {}, 'Tier', tierSel, budgetCap)),
+  );
+
   return { root: fieldset, keyInputs, vaultIndicator };
+}
+
+// -------------------------------------------------------------------- budget --
+
+/**
+ * Projected-cost estimate for the CURRENT settings + doc (Stage 7c): the
+ * preset-tier estimate from the cost model — no LLM call, mirroring Python's
+ * /api/estimate. Returns null when the doc is absent (nothing ingested yet).
+ */
+export function projectedCost(
+  settings: AppSettings,
+  doc: Document | null,
+): { preset: string; estimates: Record<string, number> } | null {
+  if (!doc) return null;
+  const pricing: Record<string, PricingEntry> = {};
+  for (const role of ['strong', 'small', 'vision'] as const) {
+    const rc = settings.roles[role];
+    if (rc?.model && settings.pricing[rc.model])
+      pricing[rc.model] = settings.pricing[rc.model]!;
+  }
+  const specs: Record<string, { provider: string; model: string }> = {};
+  for (const role of ['strong', 'small', 'vision'] as const) {
+    const rc = settings.roles[role];
+    if (rc?.model) specs[role] = { provider: role, model: rc.model };
+  }
+  const harness = new BudgetHarness(
+    {
+      calls: [],
+      priceFor: (key) => pricing[key] ?? pricing[key.split('/').pop() ?? key],
+      totalCost: () => 0,
+    },
+    specs,
+    settings.budget?.budgetUsd ?? settings.maxCostUsd,
+    true,
+  );
+  harness.stats = documentStatsFromDoc(doc);
+  return {
+    preset: settings.budget?.depth ?? 'standard',
+    estimates: harness.preset_estimates(),
+  };
+}
+
+/** Spend-so-far line for the progress panel (7c). */
+export function spendSoFarLine(runState: RunState): string {
+  const calls = runState.ledgerCalls ?? [];
+  const spent = calls.reduce((s, c) => s + c.costUsd, 0);
+  const plan = runState.plan as
+    { budget_usd?: number; target_usd?: number } | undefined;
+  const cap = plan?.budget_usd;
+  const parts = [`Spent so far: $${spent.toFixed(4)}`];
+  if (cap !== undefined) parts.push(`of $${cap.toFixed(2)} cap`);
+  if (plan?.target_usd !== undefined)
+    parts.push(`(plan target $${plan.target_usd.toFixed(2)})`);
+  return parts.join(' ');
+}
+
+/**
+ * BudgetExceeded top-up affordance (7c): a "Top up & resume" control bound
+ * to an incomplete run. Raises the cap in settings and re-enters the
+ * pipeline via the existing resume machinery — the button just resumes.
+ */
+export function topUpControl(io: {
+  runState: RunState;
+  settings: AppSettings;
+  onResume: (raisedCapUsd: number) => void;
+}): HTMLElement {
+  const wrap = el('div', { id: 'budget-topup', class: 'budget-topup' });
+  wrap.appendChild(
+    el(
+      'p',
+      { class: 'budget-topup-note' },
+      'The budget cap stopped this run before the report completed. Completed stages are kept — raise the cap and resume from where it stopped.',
+    ),
+  );
+  const input = el('input', {
+    type: 'number',
+    min: '0',
+    step: '1',
+    id: 'topup-amount',
+    'aria-label': 'new budget cap in USD',
+    placeholder: 'new cap (USD)',
+  });
+  const btn = el('button', { type: 'button', id: 'topup-resume' }, 'Top up & resume');
+  btn.addEventListener('click', () => {
+    const v = Number(input.value);
+    if (!Number.isFinite(v) || v <= 0) {
+      input.setAttribute('aria-invalid', 'true');
+      return;
+    }
+    // Persist the raised cap (the run resumes under the new ceiling), then
+    // hand off to the resume flow.
+    io.settings.budget = { ...(io.settings.budget ?? {}), budgetUsd: v };
+    if (v > io.settings.maxCostUsd) io.settings.maxCostUsd = v;
+    saveSettings(io.settings);
+    io.onResume(v);
+  });
+  wrap.append(input, btn);
+  return wrap;
 }
 
 // -------------------------------------------------------------------- report --
@@ -571,12 +825,15 @@ function createResumeSection(io: {
             providers = await io.buildProviders();
             io.setActiveProviders(providers);
             const progress = new ProgressController(io.progressRoot);
+            // 7e review (B6): the resume path gets the decision caller too.
+            const decider = await buildDecider(io.settings);
             const gen = runReview({
               doc: null as unknown as Document,
               settings: io.settings,
               providers: providers as { strong: ChatProvider; small: ChatProvider },
+              decider,
               searchApiKeys: io.settings.searchApiKeys,
-              resume: { state, settings: io.settings },
+              resume: { state, settings: io.settings, decider },
               onEvent: (e, p) => progress.onEvent(e, p),
             });
             let final: RunState | undefined;
@@ -732,6 +989,9 @@ export function mountApp(root: HTMLElement): void {
         let provider = seen.get(name);
         if (!provider) {
           const apiKey = await resolveKey(name);
+          // 7d review (C1): the role's capability flag rides the binding —
+          // a shared provider keeps the flag of the role that built it.
+          const supportsReasoning = settings.roles[role].supportsReasoning;
           provider = createProvider({
             providerType: cfg.type,
             baseUrl: cfg.baseUrl,
@@ -739,6 +999,7 @@ export function mountApp(root: HTMLElement): void {
             rateLimiter,
             requestTimeoutS: settings.requestTimeoutS,
             maxRetries: settings.maxRetries,
+            supportsReasoning,
           });
           seen.set(name, provider);
         }
@@ -749,13 +1010,25 @@ export function mountApp(root: HTMLElement): void {
 
     let activeProviders: Record<string, ChatProvider> | null = null;
     (async () => {
+      const progress = new ProgressController(progressRoot);
+      // Projected cost before the first call (7c spec: estimate display —
+      // same cost model as Python's /api/estimate, zero LLM calls).
+      const est = projectedCost(settings, doc);
+      if (est) {
+        const tierEst = est.estimates[est.preset];
+        if (tierEst !== undefined) {
+          progress.setSpend(`Projected (${est.preset}): $${tierEst.toFixed(2)}`);
+        }
+      }
       const providers = await buildProviders();
       activeProviders = providers;
-      const progress = new ProgressController(progressRoot);
+      // 7e review (B6): construct the decision provider from the bound role.
+      const decider = await buildDecider(settings);
       const gen = runReview({
         doc: doc,
         settings,
         providers: providers as { strong: ChatProvider; small: ChatProvider },
+        decider,
         searchApiKeys: settings.searchApiKeys,
         onEvent: (e, p) => progress.onEvent(e, p),
       });
@@ -766,7 +1039,15 @@ export function mountApp(root: HTMLElement): void {
           state = next.value;
           break;
         }
+        // Spend-so-far in the progress panel (7c): append to each label tick.
+        if (state === undefined) {
+          // The pipeline persists ledger records as it goes; surface them.
+          const runs = await listRuns().catch(() => []);
+          const live = runs.find((r) => r.report === undefined && r.ledgerCalls);
+          if (live) progress.setSpend(spendSoFarLine(live));
+        }
       }
+      if (state) progress.setSpend(spendSoFarLine(state));
       progress.finish(
         state?.partial
           ? 'Run finished (partial report)'
@@ -782,6 +1063,85 @@ export function mountApp(root: HTMLElement): void {
         merged.appendChild(
           reportView(report, state, merged.firstChild as HTMLElement | null),
         );
+        // BudgetExceeded -> top-up affordance (7c): a partial run whose
+        // assembled report stopped on the cap gets a resume control.
+        if (report.partial) {
+          const budgetDrained = (state.events ?? []).some(
+            (e) => e.detail !== undefined && e.detail.includes('budget cap reached'),
+          );
+          if (budgetDrained) {
+            merged.appendChild(
+              topUpControl({
+                runState: state,
+                settings,
+                onResume: () => {
+                  // Reload the persisted state and re-enter the pipeline
+                  // through the REAL resume path (doc:null + resume:{state}
+                  // — runBtn.click() would start a fresh run).
+                  void (async () => {
+                    const saved = await loadRun(state!.runId);
+                    if (!saved) return;
+                    output.replaceChildren();
+                    const progress = new ProgressController(progressRoot);
+                    const providers = await buildProviders();
+                    activeProviders = providers;
+                    const topUpDecider = await buildDecider(settings);
+                    const gen = runReview({
+                      doc: null as unknown as Document,
+                      settings,
+                      providers: providers as {
+                        strong: ChatProvider;
+                        small: ChatProvider;
+                      },
+                      decider: topUpDecider,
+                      searchApiKeys: settings.searchApiKeys,
+                      resume: { state: saved, settings, decider: topUpDecider },
+                      onEvent: (e, p) => progress.onEvent(e, p),
+                    });
+                    let final: RunState | undefined;
+                    for (;;) {
+                      const next = await gen.next();
+                      if (next.done) {
+                        final = next.value;
+                        break;
+                      }
+                    }
+                    progress.finish(
+                      final?.partial
+                        ? 'Resumed run finished (partial report)'
+                        : 'Resumed run finished — report ready',
+                    );
+                    if (
+                      final &&
+                      final.report !== undefined &&
+                      typeof final.report === 'object'
+                    ) {
+                      const merged = el('div', {});
+                      if (final.docData) {
+                        merged.appendChild(
+                          manuscriptView(
+                            documentFromData(final.docData as DocumentData),
+                          ),
+                        );
+                      }
+                      merged.appendChild(
+                        reportView(
+                          final.report as ReviewReport,
+                          final,
+                          merged.firstChild as HTMLElement | null,
+                        ),
+                      );
+                      output.replaceChildren(merged);
+                    }
+                  })().catch((err: unknown) => {
+                    errorBox.textContent = `Resume failed: ${err instanceof Error ? err.message : String(err)}`;
+                    errorBox.hidden = false;
+                  });
+                },
+              }),
+            );
+          }
+        }
         output.replaceChildren(merged);
       }
     })()
@@ -833,6 +1193,8 @@ export function mountApp(root: HTMLElement): void {
         let provider = seen.get(name);
         if (!provider) {
           const apiKey = await resolveKey(name);
+          // 7d review (C1): the role's capability flag rides the binding.
+          const supportsReasoning = settings.roles[role].supportsReasoning;
           provider = createProvider({
             providerType: cfg.type,
             baseUrl: cfg.baseUrl,
@@ -840,6 +1202,7 @@ export function mountApp(root: HTMLElement): void {
             rateLimiter,
             requestTimeoutS: settings.requestTimeoutS,
             maxRetries: settings.maxRetries,
+            supportsReasoning,
           });
           seen.set(name, provider);
         }
